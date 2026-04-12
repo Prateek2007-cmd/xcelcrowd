@@ -1,5 +1,5 @@
 /**
- * Application routes — thin wrappers that parse input and delegate to services.
+ * Application routes — thin wrappers using validation middleware.
  * No direct DB access. Errors bubble up to the global error handler.
  */
 import { Router, type IRouter } from "express";
@@ -8,7 +8,7 @@ import {
   WithdrawApplicationBody,
   AcknowledgePromotionBody,
 } from "@workspace/api-zod";
-import { ValidationError } from "../lib/errors";
+import { validateBody } from "../middlewares/validate";
 import {
   applyToJob,
   withdrawApplication,
@@ -17,42 +17,27 @@ import {
 
 const router: IRouter = Router();
 
-router.post("/apply", async (req, res, next): Promise<void> => {
+router.post("/apply", validateBody(ApplyToJobBody), async (req, res, next): Promise<void> => {
   try {
-    const parsed = ApplyToJobBody.safeParse(req.body);
-    if (!parsed.success) {
-      throw new ValidationError(parsed.error.message);
-    }
-
-    const result = await applyToJob(parsed.data.applicantId, parsed.data.jobId);
+    const result = await applyToJob(req.body.applicantId, req.body.jobId);
     res.status(201).json(result);
   } catch (err) {
     next(err);
   }
 });
 
-router.post("/withdraw", async (req, res, next): Promise<void> => {
+router.post("/withdraw", validateBody(WithdrawApplicationBody), async (req, res, next): Promise<void> => {
   try {
-    const parsed = WithdrawApplicationBody.safeParse(req.body);
-    if (!parsed.success) {
-      throw new ValidationError(parsed.error.message);
-    }
-
-    const result = await withdrawApplication(parsed.data.applicationId);
+    const result = await withdrawApplication(req.body.applicationId);
     res.json(result);
   } catch (err) {
     next(err);
   }
 });
 
-router.post("/acknowledge", async (req, res, next): Promise<void> => {
+router.post("/acknowledge", validateBody(AcknowledgePromotionBody), async (req, res, next): Promise<void> => {
   try {
-    const parsed = AcknowledgePromotionBody.safeParse(req.body);
-    if (!parsed.success) {
-      throw new ValidationError(parsed.error.message);
-    }
-
-    const result = await acknowledgePromotion(parsed.data.applicationId);
+    const result = await acknowledgePromotion(req.body.applicationId);
     res.json(result);
   } catch (err) {
     next(err);

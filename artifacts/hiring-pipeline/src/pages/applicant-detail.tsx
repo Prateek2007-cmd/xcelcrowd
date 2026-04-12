@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useParams, Link } from "wouter";
 import { useQueryClient } from "@tanstack/react-query";
 import { format } from "date-fns";
@@ -87,7 +86,7 @@ export default function ApplicantDetail() {
           toast({ title: "Applied successfully" });
           form.reset();
         },
-        onError: (err) => {
+        onError: () => {
           toast({ title: "Application failed", variant: "destructive" });
         },
       }
