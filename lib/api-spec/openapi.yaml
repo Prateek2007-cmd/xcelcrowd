@@ -2,14 +2,23 @@ openapi: 3.1.0
 info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
-  version: 0.1.0
-  description: API specification
+  version: 1.0.0
+  description: Self-Moving Hiring Pipeline API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: jobs
+    description: Job management
+  - name: applicants
+    description: Applicant management
+  - name: applications
+    description: Application lifecycle
+  - name: pipeline
+    description: Pipeline state and analytics
+
 paths:
   /healthz:
     get:
@@ -24,13 +33,754 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /jobs:
+    get:
+      operationId: listJobs
+      tags: [jobs]
+      summary: List all jobs
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Job"
+    post:
+      operationId: createJob
+      tags: [jobs]
+      summary: Create a new job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobBody"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "400":
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /jobs/{jobId}:
+    get:
+      operationId: getJob
+      tags: [jobs]
+      summary: Get a job with its pipeline
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobWithPipeline"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /applicants:
+    get:
+      operationId: listApplicants
+      tags: [applicants]
+      summary: List all applicants
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Applicant"
+    post:
+      operationId: createApplicant
+      tags: [applicants]
+      summary: Register a new applicant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApplicantBody"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Applicant"
+        "400":
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /applicants/{applicantId}:
+    get:
+      operationId: getApplicant
+      tags: [applicants]
+      summary: Get applicant details
+      parameters:
+        - name: applicantId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Applicant"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /apply:
+    post:
+      operationId: applyToJob
+      tags: [applications]
+      summary: Apply to a job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyBody"
+      responses:
+        "201":
+          description: Application created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplicationResult"
+        "400":
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Already applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /withdraw:
+    post:
+      operationId: withdrawApplication
+      tags: [applications]
+      summary: Withdraw an application
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WithdrawBody"
+      responses:
+        "200":
+          description: Withdrawn
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplicationResult"
+        "400":
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /acknowledge:
+    post:
+      operationId: acknowledgePromotion
+      tags: [applications]
+      summary: Acknowledge a promotion within the time window
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcknowledgeBody"
+      responses:
+        "200":
+          description: Acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplicationResult"
+        "400":
+          description: Bad Request or window expired
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /status/{applicantId}:
+    get:
+      operationId: getApplicantStatus
+      tags: [applicants]
+      summary: Get an applicant's current status across all jobs
+      parameters:
+        - name: applicantId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplicantStatus"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /queue/{jobId}:
+    get:
+      operationId: getJobQueue
+      tags: [pipeline]
+      summary: Get the full waitlist queue for a job
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobQueue"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /timeline/{applicantId}:
+    get:
+      operationId: getApplicantTimeline
+      tags: [applicants]
+      summary: Get the full event timeline for an applicant
+      parameters:
+        - name: applicantId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AuditLog"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /pipeline/{jobId}/summary:
+    get:
+      operationId: getPipelineSummary
+      tags: [pipeline]
+      summary: Get a job pipeline summary with counts and metrics
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PipelineSummary"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /pipeline/{jobId}/replay:
+    get:
+      operationId: replayPipeline
+      tags: [pipeline]
+      summary: Replay pipeline state from audit logs at a given timestamp
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: asOf
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PipelineReplay"
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   schemas:
     HealthStatus:
       type: object
+      required:
+        - status
       properties:
         status:
           type: string
-      required:
-        - status
 
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+
+    Job:
+      type: object
+      required:
+        - id
+        - title
+        - capacity
+        - activeCount
+        - waitlistCount
+        - createdAt
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        description:
+          type: ["string", "null"]
+        capacity:
+          type: integer
+        activeCount:
+          type: integer
+        waitlistCount:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+
+    CreateJobBody:
+      type: object
+      required:
+        - title
+        - capacity
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        capacity:
+          type: integer
+          minimum: 1
+
+    JobWithPipeline:
+      type: object
+      required:
+        - id
+        - title
+        - capacity
+        - activeApplicants
+        - waitlistApplicants
+        - createdAt
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        description:
+          type: ["string", "null"]
+        capacity:
+          type: integer
+        activeApplicants:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApplicationEntry"
+        waitlistApplicants:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApplicationEntry"
+        createdAt:
+          type: string
+          format: date-time
+
+    ApplicationEntry:
+      type: object
+      required:
+        - applicationId
+        - applicantId
+        - applicantName
+        - applicantEmail
+        - status
+        - appliedAt
+      properties:
+        applicationId:
+          type: integer
+        applicantId:
+          type: integer
+        applicantName:
+          type: string
+        applicantEmail:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, WAITLIST, PENDING_ACKNOWLEDGMENT, INACTIVE]
+        queuePosition:
+          type: ["integer", "null"]
+        appliedAt:
+          type: string
+          format: date-time
+        promotedAt:
+          type: ["string", "null"]
+          format: date-time
+        acknowledgeDeadline:
+          type: ["string", "null"]
+          format: date-time
+
+    Applicant:
+      type: object
+      required:
+        - id
+        - name
+        - email
+        - createdAt
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        email:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    CreateApplicantBody:
+      type: object
+      required:
+        - name
+        - email
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+
+    ApplyBody:
+      type: object
+      required:
+        - applicantId
+        - jobId
+      properties:
+        applicantId:
+          type: integer
+        jobId:
+          type: integer
+
+    WithdrawBody:
+      type: object
+      required:
+        - applicationId
+      properties:
+        applicationId:
+          type: integer
+
+    AcknowledgeBody:
+      type: object
+      required:
+        - applicationId
+      properties:
+        applicationId:
+          type: integer
+
+    ApplicationResult:
+      type: object
+      required:
+        - applicationId
+        - applicantId
+        - jobId
+        - status
+      properties:
+        applicationId:
+          type: integer
+        applicantId:
+          type: integer
+        jobId:
+          type: integer
+        status:
+          type: string
+          enum: [ACTIVE, WAITLIST, PENDING_ACKNOWLEDGMENT, INACTIVE]
+        queuePosition:
+          type: ["integer", "null"]
+        message:
+          type: string
+
+    ApplicantStatus:
+      type: object
+      required:
+        - applicantId
+        - applicantName
+        - applicantEmail
+        - applications
+      properties:
+        applicantId:
+          type: integer
+        applicantName:
+          type: string
+        applicantEmail:
+          type: string
+        applications:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApplicationStatusEntry"
+
+    ApplicationStatusEntry:
+      type: object
+      required:
+        - applicationId
+        - jobId
+        - jobTitle
+        - status
+        - appliedAt
+      properties:
+        applicationId:
+          type: integer
+        jobId:
+          type: integer
+        jobTitle:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, WAITLIST, PENDING_ACKNOWLEDGMENT, INACTIVE]
+        queuePosition:
+          type: ["integer", "null"]
+        appliedAt:
+          type: string
+          format: date-time
+        promotedAt:
+          type: ["string", "null"]
+          format: date-time
+        acknowledgeDeadline:
+          type: ["string", "null"]
+          format: date-time
+        timeInCurrentStateSeconds:
+          type: integer
+
+    JobQueue:
+      type: object
+      required:
+        - jobId
+        - jobTitle
+        - capacity
+        - activeCount
+        - waitlistEntries
+      properties:
+        jobId:
+          type: integer
+        jobTitle:
+          type: string
+        capacity:
+          type: integer
+        activeCount:
+          type: integer
+        waitlistEntries:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueueEntry"
+
+    QueueEntry:
+      type: object
+      required:
+        - applicationId
+        - applicantId
+        - applicantName
+        - position
+        - appliedAt
+        - penaltyCount
+      properties:
+        applicationId:
+          type: integer
+        applicantId:
+          type: integer
+        applicantName:
+          type: string
+        position:
+          type: integer
+        appliedAt:
+          type: string
+          format: date-time
+        penaltyCount:
+          type: integer
+
+    AuditLog:
+      type: object
+      required:
+        - id
+        - applicationId
+        - eventType
+        - toStatus
+        - createdAt
+      properties:
+        id:
+          type: integer
+        applicationId:
+          type: integer
+        eventType:
+          type: string
+        fromStatus:
+          type: ["string", "null"]
+        toStatus:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: {}
+        createdAt:
+          type: string
+          format: date-time
+
+    PipelineSummary:
+      type: object
+      required:
+        - jobId
+        - jobTitle
+        - capacity
+        - activeCount
+        - waitlistCount
+        - inactiveCount
+        - totalApplications
+        - decayEvents
+      properties:
+        jobId:
+          type: integer
+        jobTitle:
+          type: string
+        capacity:
+          type: integer
+        activeCount:
+          type: integer
+        waitlistCount:
+          type: integer
+        inactiveCount:
+          type: integer
+        totalApplications:
+          type: integer
+        avgTimeToPromotionSeconds:
+          type: ["number", "null"]
+        avgAcknowledgmentTimeSeconds:
+          type: ["number", "null"]
+        decayEvents:
+          type: integer
+
+    PipelineReplay:
+      type: object
+      required:
+        - jobId
+        - asOf
+        - activeApplicants
+        - waitlistApplicants
+        - events
+      properties:
+        jobId:
+          type: integer
+        asOf:
+          type: string
+          format: date-time
+        activeApplicants:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReplayEntry"
+        waitlistApplicants:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReplayEntry"
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditLog"
+
+    ReplayEntry:
+      type: object
+      required:
+        - applicationId
+        - applicantId
+        - applicantName
+        - status
+      properties:
+        applicationId:
+          type: integer
+        applicantId:
+          type: integer
+        applicantName:
+          type: string
+        status:
+          type: string

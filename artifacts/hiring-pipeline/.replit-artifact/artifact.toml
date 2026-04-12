@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Hiring Pipeline"
+version = "1.0.0"
+id = "artifacts/hiring-pipeline"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22612
+
+[services.development]
+run = "pnpm --filter @workspace/hiring-pipeline run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/hiring-pipeline", "run", "build" ]
+publicDir = "artifacts/hiring-pipeline/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22612"
+BASE_PATH = "/"

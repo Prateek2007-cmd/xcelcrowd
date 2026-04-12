@@ -1,0 +1,250 @@
+You are a senior backend-focused full-stack engineer building a production-grade system.
+
+Project: "Self-Moving Hiring Pipeline"
+
+Objective:
+Build a backend-heavy web application that manages a hiring pipeline with automatic waitlist promotion, inactivity decay, and full traceability. The system must operate without manual intervention once configured.
+
+IMPORTANT:
+This is a backend-focused system. The frontend must be minimal and only used to visualize system state.
+
+========================
+TECH STACK
+==========
+
+* Backend: Node.js + Express + TypeScript
+* Database: PostgreSQL
+* Frontend: React (Vite) + TypeScript
+* Styling: Minimal (Tailwind or basic CSS)
+* Testing: Jest
+* No external queue/job libraries
+
+========================
+CORE FEATURES
+=============
+
+1. Job Management:
+
+* Create job with fixed ACTIVE capacity
+
+2. Application Flow:
+
+* If capacity available → applicant becomes ACTIVE
+* Else → applicant enters WAITLIST (FIFO queue)
+
+3. Automatic Promotion:
+
+* When ACTIVE applicant exits → next WAITLIST applicant is promoted automatically
+
+4. Applicant Capabilities:
+
+* View status: ACTIVE / WAITLIST / INACTIVE
+* View queue position
+* View full event timeline
+
+5. Concurrency Handling (CRITICAL):
+
+* Handle simultaneous applications safely
+* Prevent overfilling capacity
+* Ensure deterministic queue order
+
+6. Full Audit Logging (CRITICAL):
+
+* Every state transition must be recorded
+* System must be fully reconstructable from logs (event-driven thinking)
+
+7. Inactivity Decay System (MOST IMPORTANT):
+
+* When promoted → applicant must acknowledge within time window
+* If not:
+
+  * Move back to waitlist with penalty position
+  * Promote next applicant
+  * Continue cascade automatically
+
+========================
+BACKEND ARCHITECTURE
+====================
+
+Use clean layered architecture:
+
+* controllers/
+* services/
+* repositories/
+* models/
+* middlewares/
+* utils/
+
+Requirements:
+
+* Strict separation of concerns
+* Transaction-safe operations
+* Concurrency-safe queue logic
+* Centralized error handling
+* Input validation
+
+========================
+DATABASE DESIGN
+===============
+
+Tables:
+
+* jobs
+* applicants
+* applications
+* queue_positions
+* audit_logs
+
+Requirements:
+
+* Proper indexing
+* Referential integrity
+* Support reconstruction of pipeline from logs
+
+========================
+API ENDPOINTS
+=============
+
+POST /jobs
+POST /apply
+POST /withdraw
+POST /acknowledge
+GET /status/:applicantId
+GET /queue/:jobId
+GET /timeline/:applicantId
+
+========================
+FRONTEND (MINIMAL)
+==================
+
+Company Dashboard:
+
+* Create job
+* View pipeline:
+
+  * Active applicants
+  * Waitlist (ordered)
+
+Applicant View:
+
+* Apply
+* View status
+* View queue position
+* View timeline
+
+UI Rules:
+
+* Keep it simple
+* No heavy design
+* Focus on clarity
+
+========================
+CONCURRENCY STRATEGY
+====================
+
+* Use database transactions
+* Prevent double promotions
+* Ensure atomic updates
+* Handle simultaneous apply edge case
+
+========================
+TESTING
+=======
+
+* Unit tests for service layer
+* Cover edge cases:
+
+  * simultaneous applications
+  * promotion + decay conflicts
+  * queue consistency
+
+========================
+SECURITY
+========
+
+* Use environment variables
+* No secrets in code
+* Validate inputs
+* Prevent SQL/NoSQL injection
+
+========================
+BONUS FEATURES (IMPORTANT)
+==========================
+
+* Event replay system:
+  → Reconstruct full pipeline from audit logs
+* Time metrics:
+  → Track time spent in each state
+* CI/CD (GitHub Actions)
+* ESLint + Prettier
+* Detailed README:
+
+  * Architecture decisions
+  * Tradeoffs
+  * Scaling discussion
+
+========================
+DEVELOPMENT STYLE (VERY IMPORTANT)
+==================================
+
+* DO NOT generate entire project at once
+* Build incrementally in phases:
+
+PHASE 1:
+
+* Database schema
+* State machine design
+
+PHASE 2:
+
+* Repository layer
+
+PHASE 3:
+
+* Service layer (core logic)
+
+PHASE 4:
+
+* API layer
+
+PHASE 5:
+
+* Frontend (minimal)
+
+PHASE 6:
+
+* Edge cases + decay system
+
+PHASE 7:
+
+* Testing + logging improvements
+
+At each phase:
+
+* Explain decisions
+* Implement clean, non-generic code
+* Avoid over-scaffolding
+
+========================
+AI COLLABORATION RULE
+=====================
+
+* Do NOT blindly generate code
+* Explain reasoning before implementation
+* Handle edge cases explicitly
+* Avoid generic boilerplate patterns
+* Produce human-like iterative development
+
+========================
+DELIVERABLE
+===========
+
+* Fully working full-stack app
+* Clean architecture
+* Traceable logic
+* High-quality README
+
+Start with:
+
+1. Database schema (tables + relationships)
+2. State machine design for applicant lifecycle
