@@ -35,7 +35,9 @@ router.get("/queue/:jobId", async (req, res): Promise<void> => {
     return;
   }
 
-  await checkAndDecayExpiredAcknowledgments(job.id, job.capacity);
+  await db.transaction(async (tx) => {
+    await checkAndDecayExpiredAcknowledgments(job.id, job.capacity, tx);
+  });
 
   const queue = await db
     .select({

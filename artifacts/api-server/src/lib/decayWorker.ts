@@ -23,10 +23,13 @@ async function runDecayCycle(): Promise<void> {
 
       if (!job) continue;
 
-      const decayed = await checkAndDecayExpiredAcknowledgments(jobId, job.capacity);
-      if (decayed > 0) {
-        logger.info({ jobId, decayed }, "Decay worker: processed expired acknowledgments");
-      }
+      // Run the entire decay+promote cycle in a single transaction
+      await db.transaction(async (tx) => {
+        const decayed = await checkAndDecayExpiredAcknowledgments(jobId, job.capacity, tx);
+        if (decayed > 0) {
+          logger.info({ jobId, decayed }, "Decay worker: processed expired acknowledgments");
+        }
+      });
     }
   } catch (err) {
     logger.error({ err }, "Decay worker: error during cycle");

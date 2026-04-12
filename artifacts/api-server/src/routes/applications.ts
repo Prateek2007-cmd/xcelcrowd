@@ -16,6 +16,7 @@ import {
 import {
   getActiveCount,
   promoteNext,
+  promoteUntilFull,
   checkAndDecayExpiredAcknowledgments,
   applyPenaltyAndRequeue,
 } from "../services/pipeline";
@@ -53,6 +54,7 @@ router.post("/apply", async (req, res): Promise<void> => {
     return;
   }
 
+  // Check for existing non-INACTIVE application (outside tx for early exit)
   const existingApps = await db
     .select()
     .from(applicationsTable)
@@ -72,13 +74,16 @@ router.post("/apply", async (req, res): Promise<void> => {
     return;
   }
 
-  await checkAndDecayExpiredAcknowledgments(jobId, job.capacity);
-
   let finalStatus: "ACTIVE" | "WAITLIST" = "WAITLIST";
   let queuePosition: number | null = null;
+  let newAppId: number = 0;
 
   await db.transaction(async (tx) => {
-    const activeCount = await getActiveCount(jobId);
+    // Run decay check INSIDE the transaction so state is consistent
+    await checkAndDecayExpiredAcknowledgments(jobId, job.capacity, tx);
+
+    // Read active count INSIDE the transaction via tx
+    const activeCount = await getActiveCount(jobId, tx);
 
     if (activeCount < job.capacity) {
       finalStatus = "ACTIVE";
@@ -92,6 +97,8 @@ router.post("/apply", async (req, res): Promise<void> => {
         status: finalStatus,
       })
       .returning();
+
+    newAppId = newApp.id;
 
     await tx.insert(auditLogsTable).values({
       applicationId: newApp.id,
@@ -115,18 +122,18 @@ router.post("/apply", async (req, res): Promise<void> => {
         position: queuePosition,
       });
     }
+  });
 
-    res.status(201).json({
-      applicationId: newApp.id,
-      applicantId,
-      jobId,
-      status: finalStatus,
-      queuePosition,
-      message:
-        finalStatus === "ACTIVE"
-          ? "You have been placed in an active slot."
-          : `You have been added to the waitlist at position ${queuePosition}.`,
-    });
+  res.status(201).json({
+    applicationId: newAppId,
+    applicantId,
+    jobId,
+    status: finalStatus,
+    queuePosition,
+    message:
+      finalStatus === "ACTIVE"
+        ? "You have been placed in an active slot."
+        : `You have been added to the waitlist at position ${queuePosition}.`,
   });
 });
 
@@ -150,7 +157,7 @@ router.post("/withdraw", async (req, res): Promise<void> => {
   }
 
   if (app.status === "INACTIVE") {
-    res.status(400).json({ error: "Application is already inactive" });
+    res.status(409).json({ error: "Application is already inactive" });
     return;
   }
 
@@ -172,6 +179,9 @@ router.post("/withdraw", async (req, res): Promise<void> => {
       .set({
         status: "INACTIVE",
         withdrawnAt: new Date(),
+        // Clear stale timestamps on withdrawal
+        promotedAt: null,
+        acknowledgeDeadline: null,
       })
       .where(eq(applicationsTable.id, applicationId));
 
@@ -187,6 +197,7 @@ router.post("/withdraw", async (req, res): Promise<void> => {
       metadata: { jobId: app.jobId },
     });
 
+    // promoteNext now correctly reads active count within tx
     if (wasActive) {
       await promoteNext(app.jobId, job.capacity, tx);
     }
@@ -222,7 +233,7 @@ router.post("/acknowledge", async (req, res): Promise<void> => {
   }
 
   if (app.status !== "PENDING_ACKNOWLEDGMENT") {
-    res.status(400).json({ error: "Application is not pending acknowledgment" });
+    res.status(409).json({ error: "Application is not pending acknowledgment" });
     return;
   }
 
@@ -234,11 +245,14 @@ router.post("/acknowledge", async (req, res): Promise<void> => {
       .where(eq(jobsTable.id, app.jobId));
 
     if (job) {
-      await applyPenaltyAndRequeue(applicationId, app.jobId);
-      await promoteNext(app.jobId, job.capacity);
+      // Wrap decay+promote in a single transaction
+      await db.transaction(async (tx) => {
+        await applyPenaltyAndRequeue(applicationId, app.jobId, tx);
+        await promoteNext(app.jobId, job.capacity, tx);
+      });
     }
 
-    res.status(400).json({
+    res.status(410).json({
       error: "Acknowledgment window has expired. You have been returned to the waitlist with a penalty.",
     });
     return;

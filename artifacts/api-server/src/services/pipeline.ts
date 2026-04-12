@@ -10,8 +10,13 @@ import { logger } from "../lib/logger";
 
 const ACKNOWLEDGE_WINDOW_MS = 5 * 60 * 1000;
 
-export async function getActiveCount(jobId: number): Promise<number> {
-  const [row] = await db
+/**
+ * Count ACTIVE + PENDING_ACKNOWLEDGMENT applications for a job.
+ * MUST be called with `tx` when used inside a transaction — otherwise
+ * it reads pre-commit state and produces incorrect results.
+ */
+export async function getActiveCount(jobId: number, tx: typeof db = db): Promise<number> {
+  const [row] = await tx
     .select({
       count: sql<number>`COUNT(*)`,
     })
@@ -42,12 +47,17 @@ export async function getNextInQueue(
   return row ?? null;
 }
 
+/**
+ * Promote the next waitlisted applicant to PENDING_ACKNOWLEDGMENT
+ * if there is capacity available. All reads/writes use `tx` so this
+ * is safe to call inside a transaction.
+ */
 export async function promoteNext(
   jobId: number,
   jobCapacity: number,
   tx: typeof db = db
 ): Promise<void> {
-  const activeCount = await getActiveCount(jobId);
+  const activeCount = await getActiveCount(jobId, tx);
   if (activeCount >= jobCapacity) {
     return;
   }
@@ -101,6 +111,31 @@ export async function promoteNext(
     { applicationId: next.applicationId, jobId, deadline },
     "Applicant promoted to PENDING_ACKNOWLEDGMENT"
   );
+}
+
+/**
+ * Fill all available active slots from the waitlist queue.
+ * Keeps promoting until capacity is full or queue is empty.
+ */
+export async function promoteUntilFull(
+  jobId: number,
+  jobCapacity: number,
+  tx: typeof db = db
+): Promise<number> {
+  let promoted = 0;
+  // Safety limit to prevent infinite loops
+  const maxIterations = jobCapacity;
+  for (let i = 0; i < maxIterations; i++) {
+    const activeCount = await getActiveCount(jobId, tx);
+    if (activeCount >= jobCapacity) break;
+
+    const next = await getNextInQueue(jobId, tx);
+    if (!next) break;
+
+    await promoteNext(jobId, jobCapacity, tx);
+    promoted++;
+  }
+  return promoted;
 }
 
 export async function reindexQueue(jobId: number, tx: typeof db = db): Promise<void> {
@@ -169,6 +204,11 @@ export async function applyPenaltyAndRequeue(
   logger.info({ applicationId, jobId, penaltyCount, penaltyPos }, "Decay triggered, applicant penalized");
 }
 
+/**
+ * Decay all expired PENDING_ACKNOWLEDGMENT applicants for a job,
+ * then fill all vacated slots from the waitlist.
+ * All operations run inside the provided transaction.
+ */
 export async function checkAndDecayExpiredAcknowledgments(
   jobId: number,
   jobCapacity: number,
@@ -192,8 +232,9 @@ export async function checkAndDecayExpiredAcknowledgments(
     decayed++;
   }
 
+  // Promote once per vacated slot (not just once total)
   if (decayed > 0) {
-    await promoteNext(jobId, jobCapacity, tx);
+    await promoteUntilFull(jobId, jobCapacity, tx);
   }
 
   return decayed;
