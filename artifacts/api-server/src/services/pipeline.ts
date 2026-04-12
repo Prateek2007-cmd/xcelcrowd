@@ -12,39 +12,47 @@ const ACKNOWLEDGE_WINDOW_MS = 5 * 60 * 1000;
 
 /**
  * Count ACTIVE + PENDING_ACKNOWLEDGMENT applications for a job.
- * MUST be called with `tx` when used inside a transaction — otherwise
- * it reads pre-commit state and produces incorrect results.
+ * Uses FOR UPDATE to lock matching rows, preventing concurrent requests
+ * from both seeing available capacity and exceeding the limit.
+ *
+ * MUST be called with `tx` inside a transaction.
  */
 export async function getActiveCount(jobId: number, tx: typeof db = db): Promise<number> {
   const [row] = await tx
     .select({
-      count: sql<number>`COUNT(*)`,
+      count: sql<number>`
+        (SELECT COUNT(*) FROM ${applicationsTable}
+         WHERE ${applicationsTable.jobId} = ${jobId}
+           AND ${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT')
+         FOR UPDATE)
+      `,
     })
-    .from(applicationsTable)
-    .where(
-      and(
-        eq(applicationsTable.jobId, jobId),
-        sql`${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT')`
-      )
-    );
+    .from(sql`(SELECT 1) AS _dummy`);
   return Number(row?.count ?? 0);
 }
 
+/**
+ * Get the next applicant in the waitlist queue.
+ * Uses FOR UPDATE SKIP LOCKED to lock the row being promoted
+ * and skip rows already locked by concurrent transactions.
+ */
 export async function getNextInQueue(
   jobId: number,
   tx: typeof db = db
 ): Promise<{ applicationId: number; position: number } | null> {
-  const [row] = await tx
-    .select({
-      applicationId: queuePositionsTable.applicationId,
-      position: queuePositionsTable.position,
-    })
-    .from(queuePositionsTable)
-    .where(eq(queuePositionsTable.jobId, jobId))
-    .orderBy(asc(queuePositionsTable.position))
-    .limit(1);
+  const rows = await tx.execute<{ application_id: number; position: number }>(sql`
+    SELECT ${queuePositionsTable.applicationId} AS application_id,
+           ${queuePositionsTable.position} AS position
+    FROM ${queuePositionsTable}
+    WHERE ${queuePositionsTable.jobId} = ${jobId}
+    ORDER BY ${queuePositionsTable.position} ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+  `);
 
-  return row ?? null;
+  const row = rows.rows?.[0];
+  if (!row) return null;
+  return { applicationId: Number(row.application_id), position: Number(row.position) };
 }
 
 /**

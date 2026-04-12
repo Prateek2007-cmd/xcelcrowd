@@ -239,8 +239,12 @@ export async function withdrawApplication(applicationId: number): Promise<Withdr
 
 /**
  * Acknowledge a promotion within the time window.
- * Validates transition legality via the state machine.
- * Returns a new AcknowledgeResult — never mutates input.
+ *
+ * DESIGN: Expiry check happens BEFORE the success transaction.
+ * If expired → decay + throw GoneError (no success commit ever occurs).
+ * If valid → commit success → return result (no throws after commit).
+ *
+ * This guarantees the client response always reflects the actual committed state.
  */
 export async function acknowledgePromotion(applicationId: number): Promise<AcknowledgeResult> {
   const [app] = await db
@@ -258,7 +262,8 @@ export async function acknowledgePromotion(applicationId: number): Promise<Ackno
 
   const now = new Date();
 
-  // Check if acknowledgment window has expired
+  // ── EXPIRY CHECK (BEFORE any success transaction) ──
+  // If expired, handle the penalty and throw. No success commit will occur.
   if (app.acknowledgeDeadline && app.acknowledgeDeadline < now) {
     const [job] = await db
       .select()
@@ -272,11 +277,14 @@ export async function acknowledgePromotion(applicationId: number): Promise<Ackno
       });
     }
 
+    // Throw BEFORE any success path — client sees the error,
+    // and the DB state (penalty applied) is consistent.
     throw new GoneError(
       "Acknowledgment window has expired. You have been returned to the waitlist with a penalty."
     );
   }
 
+  // ── SUCCESS PATH (only reached if NOT expired) ──
   // Validate transition
   assertValidTransition("PENDING_ACKNOWLEDGMENT", "ACTIVE");
 
@@ -299,6 +307,8 @@ export async function acknowledgePromotion(applicationId: number): Promise<Ackno
     });
   });
 
+  // No throws after this point — the commit succeeded,
+  // so the response MUST reflect the committed state.
   logger.info({ applicationId }, "Promotion acknowledged");
 
   return {
@@ -310,3 +320,4 @@ export async function acknowledgePromotion(applicationId: number): Promise<Ackno
     message: "Promotion acknowledged. You are now ACTIVE.",
   };
 }
+

@@ -1,11 +1,12 @@
 import { Router, type IRouter } from "express";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { db } from "@workspace/db";
 import {
   applicantsTable,
   applicationsTable,
   jobsTable,
   queuePositionsTable,
+  auditLogsTable,
 } from "@workspace/db";
 import {
   CreateApplicantBody,
@@ -175,8 +176,7 @@ router.get("/timeline/:applicantId", async (req, res): Promise<void> => {
     return;
   }
 
-  const { auditLogsTable } = await import("@workspace/db");
-  const { inArray } = await import("drizzle-orm");
+
 
   const apps = await db
     .select({ id: applicationsTable.id })
