@@ -82,11 +82,13 @@ A **production-grade, full-stack hiring pipeline** built with the PERN stack (Po
 
 ### Prerequisites
 
-- **Node.js** ≥ 20
-- **pnpm** ≥ 9
-- **PostgreSQL** ≥ 15 (running locally)
+| Tool | Version | Notes |
+|------|---------|-------|
+| **Node.js** | ≥ 20 | Required for `--env-file` flag |
+| **pnpm** | ≥ 9 | Monorepo workspace manager |
+| **PostgreSQL** | ≥ 15 | Must be running locally |
 
-### 1. Clone & Install
+### Step 1 — Clone & Install
 
 ```bash
 git clone https://github.com/Prateek2007-cmd/xcelcrowd.git
@@ -94,55 +96,93 @@ cd xcelcrowd
 pnpm install
 ```
 
-### 2. Configure Environment
+### Step 2 — Set Up PostgreSQL
 
-Create `.env` in the project root:
+Make sure PostgreSQL is running. Create a database:
+
+```sql
+CREATE DATABASE hiring_pipeline;
+```
+
+### Step 3 — Configure Environment Variables
+
+**Root `.env`** (used by Drizzle migrations and the DB library):
 
 ```env
 DATABASE_URL=postgresql://postgres:your_password@localhost:5432/hiring_pipeline
 ```
 
-Create `artifacts/api-server/.env`:
+**`artifacts/api-server/.env`** (used by the API server at runtime):
 
 ```env
 DATABASE_URL=postgresql://postgres:your_password@localhost:5432/hiring_pipeline
 PORT=5000
 ```
 
-### 3. Database Setup
+> ⚠️ **Security:** Never commit `.env` files. They are already in `.gitignore`.
+
+### Step 4 — Push Database Schema
+
+This uses Drizzle Kit to create all tables in PostgreSQL:
 
 ```bash
-# Push schema to PostgreSQL
-pnpm --filter db push
+pnpm --filter @workspace/db push
 ```
 
-### 4. Start the API Server
+### Step 5 — Start the API Server
 
 ```bash
 pnpm --filter @workspace/api-server dev
 ```
 
-The API is now running at `http://localhost:5000/api`.
+This builds and starts the Express API at **http://localhost:5000**. You should see:
 
-### 5. Start the Frontend
+```
+Server listening { port: 5000 }
+Decay worker started (interval: 30s)
+```
+
+### Step 6 — Start the Frontend
+
+In a **separate terminal**:
 
 ```bash
 pnpm --filter @workspace/hiring-pipeline dev
 ```
 
-Open `http://localhost:5173` in your browser.
+Open **http://localhost:5173** in your browser. The Vite dev server proxies `/api/*` requests to `localhost:5000`.
 
-### 6. Seed the Database (Optional)
+### Step 7 — Seed the Database (Optional)
 
-With the API server running:
+With the API server running, populate sample data:
 
 ```bash
 node scripts/seed.mjs
 ```
 
-This creates 3 jobs, 5 applicants, and submits sample applications.
+This creates **3 jobs**, **5 applicants**, and submits sample applications so the dashboard is immediately populated.
+
+### Step 8 — Run Tests
+
+```bash
+# From the project root
+pnpm test
+```
+
+This runs all Vitest suites in `artifacts/api-server/src/__tests__/`.
 
 ---
+
+### 🔧 Troubleshooting
+
+| Issue | Solution |
+|-------|---------|
+| `DATABASE_URL must be set` | Ensure `.env` exists in **both** the project root and `artifacts/api-server/` |
+| `PORT environment variable is required` | Ensure `artifacts/api-server/.env` contains `PORT=5000` |
+| `FATAL: password authentication failed` | Check your PostgreSQL password in `DATABASE_URL` |
+| `relation "jobs" does not exist` | Run `pnpm --filter @workspace/db push` to create tables |
+| `ECONNREFUSED 127.0.0.1:5000` on frontend | Start the API server first before the frontend |
+| `pnpm: command not found` | Install pnpm: `npm install -g pnpm` |
 
 ## 📡 API Reference
 
