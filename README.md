@@ -1,418 +1,463 @@
-# 🏗️ Hiring Pipeline — Real-Time Queue Management System
+# Hiring Pipeline — Capacity-Limited Queue Management System
 
-A **production-grade, full-stack hiring pipeline** built with the PERN stack (PostgreSQL, Express, React, Node.js). It implements a real-time applicant queue with capacity-limited active slots, automatic waitlist promotion, acknowledgment deadlines, and decay penalties — all with transactional safety and row-level locking.
-
-> **No third-party queue or scheduling libraries.** All queue logic, waitlist promotion, and decay timing is implemented from scratch.
+A production-grade full-stack system that manages applicant queues for job positions, enforcing capacity limits, automatic waitlist promotion, acknowledgment deadlines, and decay penalties — with full auditability and concurrency safety.
 
 ---
 
-## 📸 Features at a Glance
+## Problem Statement
 
-| Feature | Description |
-|---------|-------------|
-| **Capacity-Limited Jobs** | Each job has a fixed number of active slots |
-| **Automatic Waitlisting** | Applicants beyond capacity are queued with position tracking |
-| **Promotion Engine** | When a slot opens, the next waitlisted applicant is promoted |
-| **Acknowledgment Window** | Promoted applicants must acknowledge within 5 minutes or lose their slot |
-| **Decay & Penalty System** | Expired promotions trigger a penalty and re-queue at the back |
-| **Audit Log & Replay** | Every state change is logged; pipeline state can be reconstructed at any past timestamp |
-| **Concurrency-Safe** | `FOR UPDATE` row-level locking prevents race conditions |
-| **Background Decay Worker** | Polls for expired acknowledgments every 5 seconds |
+Hiring teams managing high-volume job openings face a real coordination problem: more candidates apply than available slots. Without structure, this creates chaos — candidates don't know where they stand, slots get double-booked, and dropped candidates have no recourse.
+
+This system solves that by treating each job opening as a **capacity-limited pipeline** with a formal queue. Applicants either get an active slot or join a waitlist in order. When slots open up, the system automatically promotes the next candidate — no manual intervention needed. Candidates who don't respond lose their spot and get re-queued with a penalty.
 
 ---
 
-## 🏛️ Architecture
+## Solution Overview
+
+The system has two distinct faces:
+
+- **Applicants** — apply to jobs, track their position and status, manage their applications
+- **Company (OPS)** — create and manage job postings, monitor the pipeline, remove candidates
+
+When an applicant submits an application:
+1. If `active_count < capacity` → they get an **ACTIVE** slot immediately
+2. If full → they join the **WAITLIST** with a numbered position
+3. When a slot opens (withdrawal, removal, expiry) → the next waitlisted applicant is automatically promoted to **PENDING_ACKNOWLEDGMENT** with a 5-minute deadline
+4. If they acknowledge → they become **ACTIVE**
+5. If they don't → they're decayed back to **WAITLIST** with a penalty, and the next candidate is promoted
+
+All state changes are atomic (PostgreSQL transactions), logged (audit trail), and protected against race conditions (row-level locking).
+
+---
+
+## Core Features
+
+- **Capacity-limited jobs** — each job has a configurable number of active slots
+- **Ordered waitlist** — applicants beyond capacity are queued with explicit position numbers
+- **Automatic promotion** — when any slot opens, the next waitlisted applicant is promoted immediately
+- **Acknowledgment window** — promoted applicants have 5 minutes to confirm; missed deadlines trigger decay
+- **Inactivity decay** — expired promotions re-queue the applicant at the back with a penalty score
+- **Cascade promotion** — after decay, the system fills all vacated slots before settling
+- **Full audit log** — every state transition is recorded; the pipeline state at any past timestamp can be reconstructed
+- **Concurrency safety** — `FOR UPDATE` row locking prevents double-booking even under simultaneous load
+- **Applicant dashboard** — applicants log in by name/email, see all their applications, apply to more jobs, and withdraw — no account needed
+- **Company dashboard** — create jobs, monitor active roster and waitlist, view timelines and decay events per job
+
+---
+
+## System Design
+
+### Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                    Frontend (React)                   │
-│         Vite + TailwindCSS + Radix UI + Wouter       │
-│                    Port 5173                          │
-└──────────────────────┬───────────────────────────────┘
-                       │ /api proxy
-┌──────────────────────▼───────────────────────────────┐
-│                  API Server (Express 5)               │
-│              TypeScript + Pino Logger                 │
-│                    Port 5000                          │
-│  ┌─────────┐  ┌──────────────┐  ┌─────────────────┐ │
-│  │ Routes  │→ │   Services   │→ │    Pipeline     │ │
-│  │ (thin)  │  │ (biz logic)  │  │ (state machine) │ │
-│  └─────────┘  └──────────────┘  └─────────────────┘ │
-│  ┌─────────────────┐  ┌──────────────────────────┐   │
-│  │  Error Handler  │  │   Validation Middleware   │   │
-│  │  (PG codes)     │  │   (Zod schemas)           │   │
-│  └─────────────────┘  └──────────────────────────┘   │
-└──────────────────────┬───────────────────────────────┘
-                       │ Drizzle ORM
-┌──────────────────────▼───────────────────────────────┐
-│                   PostgreSQL                          │
-│       Jobs · Applicants · Applications ·              │
-│       Queue Positions · Audit Logs                    │
-└──────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────┐
+│           Frontend (React + Vite)        │
+│     TailwindCSS · Radix UI · Wouter     │
+│              Port 5173                   │
+└──────────────────┬──────────────────────┘
+                   │ /api proxy
+┌──────────────────▼──────────────────────┐
+│          API Server (Express 5)          │
+│          TypeScript · Pino              │
+│               Port 5000                 │
+│                                         │
+│  Routes → Services → Pipeline           │
+│  Validation Middleware (Zod)            │
+│  Global Error Handler                   │
+│  Background Decay Worker (5s poll)      │
+└──────────────────┬──────────────────────┘
+                   │ Drizzle ORM
+┌──────────────────▼──────────────────────┐
+│              PostgreSQL                  │
+│  jobs · applicants · applications       │
+│  queue_positions · audit_logs           │
+└─────────────────────────────────────────┘
 ```
 
 ### Monorepo Structure
 
 ```
 ├── artifacts/
-│   ├── api-server/          # Express API server
-│   │   ├── src/
-│   │   │   ├── routes/      # Thin route handlers (parse → service → respond)
-│   │   │   ├── services/    # Business logic (applicationService, pipeline)
-│   │   │   ├── lib/         # Errors, state machine, logger, decay worker
-│   │   │   ├── middlewares/ # Error handler, validation
-│   │   │   └── __tests__/   # Vitest unit + integration tests
-│   │   └── vitest.config.ts
-│   ├── hiring-pipeline/     # React frontend (Vite)
-│   └── mockup-sandbox/      # UI prototyping sandbox
+│   ├── api-server/
+│   │   └── src/
+│   │       ├── routes/         # Thin handlers — parse, call service, respond
+│   │       ├── services/       # Business logic (applicationService, pipeline)
+│   │       ├── lib/            # Errors, state machine, logger, decay worker
+│   │       ├── schemas/        # Server-local Zod schemas (PublicApplyBody, etc.)
+│   │       └── middlewares/    # Validation, error handling
+│   └── hiring-pipeline/        # React frontend (Vite)
 ├── lib/
-│   ├── db/                  # Drizzle ORM schema + migrations
-│   ├── api-zod/             # Shared Zod schemas for API contracts
-│   ├── api-spec/            # OpenAPI specification
-│   └── api-client-react/    # Generated React Query hooks
+│   ├── db/                     # Drizzle ORM schema + migrations
+│   ├── api-zod/                # Shared Zod schemas (generated from OpenAPI)
+│   └── api-client-react/       # React Query hooks (generated)
 ├── scripts/
-│   └── seed.mjs             # Database seeder (via API)
-├── pnpm-workspace.yaml      # Monorepo config
-└── package.json
+│   └── seed.mjs                # Seed script (creates jobs, applicants, applications)
+└── pnpm-workspace.yaml
 ```
+
+### Separation of Concerns
+
+**Routes** are intentionally thin — they validate the request body (via Zod middleware), call one service function, and return the result. No business logic, no direct DB access.
+
+**Services** own all business logic. `applicationService.ts` handles apply/withdraw/acknowledge. `pipeline.ts` handles queue operations (count, promote, reindex, decay). Neither layer knows about HTTP.
+
+**Schemas** are separated by ownership: shared API contracts live in `@workspace/api-zod` (generated from OpenAPI). Server-specific schemas (like `PublicApplyBody`) live in `src/schemas/application.ts`.
 
 ---
 
-## 🚀 Getting Started
+## State Machine
 
-### Prerequisites
-
-| Tool | Version | Notes |
-|------|---------|-------|
-| **Node.js** | ≥ 20 | Required for `--env-file` flag |
-| **pnpm** | ≥ 9 | Monorepo workspace manager |
-| **PostgreSQL** | ≥ 15 | Must be running locally |
-
-### Step 1 — Clone & Install
-
-```bash
-git clone https://github.com/Prateek2007-cmd/xcelcrowd.git
-cd xcelcrowd
-pnpm install
-```
-
-### Step 2 — Set Up PostgreSQL
-
-Make sure PostgreSQL is running. Create a database:
-
-```sql
-CREATE DATABASE hiring_pipeline;
-```
-
-### Step 3 — Configure Environment Variables
-
-**Root `.env`** (used by Drizzle migrations and the DB library):
-
-```env
-DATABASE_URL=postgresql://postgres:your_password@localhost:5432/hiring_pipeline
-```
-
-**`artifacts/api-server/.env`** (used by the API server at runtime):
-
-```env
-DATABASE_URL=postgresql://postgres:your_password@localhost:5432/hiring_pipeline
-PORT=5000
-```
-
-> ⚠️ **Security:** Never commit `.env` files. They are already in `.gitignore`.
-
-### Step 4 — Push Database Schema
-
-This uses Drizzle Kit to create all tables in PostgreSQL:
-
-```bash
-pnpm --filter @workspace/db push
-```
-
-### Step 5 — Start the API Server
-
-```bash
-pnpm --filter @workspace/api-server dev
-```
-
-This builds and starts the Express API at **http://localhost:5000**. You should see:
+Every application follows a strict state machine. No ad-hoc status changes are allowed — all transitions go through `assertValidTransition()` in `lib/stateMachine.ts`, which throws `InvalidTransitionError` (422) on illegal moves.
 
 ```
-Server listening { port: 5000 }
-Decay worker started (interval: 5s)
-```
-
-### Step 6 — Start the Frontend
-
-In a **separate terminal**:
-
-```bash
-pnpm --filter @workspace/hiring-pipeline dev
-```
-
-Open **http://localhost:5173** in your browser. The Vite dev server proxies `/api/*` requests to `localhost:5000`.
-
-### Step 7 — Seed the Database (Optional)
-
-With the API server running, populate sample data:
-
-```bash
-node scripts/seed.mjs
-```
-
-This creates **3 jobs**, **5 applicants**, and submits sample applications so the dashboard is immediately populated.
-
-### Step 8 — Run Tests
-
-```bash
-# From the project root
-pnpm test
-```
-
-This runs all Vitest suites in `artifacts/api-server/src/__tests__/`.
-
----
-
-### 🔧 Troubleshooting
-
-| Issue | Solution |
-|-------|---------|
-| `DATABASE_URL must be set` | Ensure `.env` exists in **both** the project root and `artifacts/api-server/` |
-| `PORT environment variable is required` | Ensure `artifacts/api-server/.env` contains `PORT=5000` |
-| `FATAL: password authentication failed` | Check your PostgreSQL password in `DATABASE_URL` |
-| `relation "jobs" does not exist` | Run `pnpm --filter @workspace/db push` to create tables |
-| `ECONNREFUSED 127.0.0.1:5000` on frontend | Start the API server first before the frontend |
-| `pnpm: command not found` | Install pnpm: `npm install -g pnpm` |
-
-## 📡 API Reference
-
-All endpoints are prefixed with `/api`.
-
-### Health
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/healthz` | Health check |
-
-### Jobs
-
-| Method | Endpoint | Description | Request Body | Response |
-|--------|----------|-------------|-------------|----------|
-| `GET` | `/api/jobs` | List all jobs | — | `Job[]` with activeCount, waitlistCount |
-| `POST` | `/api/jobs` | Create a job | `{ title, description?, capacity }` | `201` Created job |
-| `GET` | `/api/jobs/:jobId` | Job detail with applicants | — | Job + active/waitlist applicants |
-
-### Applicants
-
-| Method | Endpoint | Description | Request Body | Response |
-|--------|----------|-------------|-------------|----------|
-| `GET` | `/api/applicants` | List all applicants | — | `Applicant[]` |
-| `POST` | `/api/applicants` | Register an applicant | `{ name, email }` | `201` Created applicant |
-| `GET` | `/api/applicants/:id` | Get applicant by ID | — | Applicant details |
-| `GET` | `/api/status/:id` | Applicant's application status | — | All applications with queue positions |
-| `GET` | `/api/timeline/:id` | Applicant's audit event timeline | — | Ordered audit log entries |
-
-### Applications (Pipeline Actions)
-
-| Method | Endpoint | Description | Request Body | Response |
-|--------|----------|-------------|-------------|----------|
-| `POST` | `/api/apply` | Apply to a job | `{ applicantId, jobId }` | `201` ACTIVE or WAITLIST |
-| `POST` | `/api/withdraw` | Withdraw an application | `{ applicationId }` | INACTIVE + triggers promotion |
-| `POST` | `/api/acknowledge` | Acknowledge a promotion | `{ applicationId }` | ACTIVE (or `410` if expired) |
-
-### Pipeline Analytics
-
-| Method | Endpoint | Description | Query Params | Response |
-|--------|----------|-------------|-------------|----------|
-| `GET` | `/api/queue/:jobId` | Waitlist queue for a job | — | Queue entries with positions |
-| `GET` | `/api/pipeline/:jobId/summary` | Pipeline stats | — | Counts, avg times, decay events |
-| `GET` | `/api/pipeline/:jobId/replay` | Reconstruct past state | `?asOf=ISO8601` | Active/waitlist at that timestamp |
-
-### Error Response Format
-
-All errors return a consistent structure:
-
-```json
-{
-  "error": {
-    "message": "Human-readable description",
-    "code": "MACHINE_READABLE_CODE"
-  }
-}
-```
-
-| Code | HTTP | Description |
-|------|------|-------------|
-| `VALIDATION_ERROR` | 400 | Invalid input (Zod validation failure) |
-| `NOT_FOUND` | 404 | Resource does not exist |
-| `CONFLICT` | 409 | Duplicate or invalid state |
-| `DUPLICATE_SUBMISSION` | 409 | Active application already exists |
-| `GONE` | 410 | Acknowledgment window expired |
-| `INVALID_TRANSITION` | 422 | Illegal state change |
-| `DATABASE_ERROR` | 500 | Internal error |
-
----
-
-## 🔄 State Machine
-
-Every application follows this state machine:
-
-```
-                 ┌─────────────────┐
-        ┌───────►│    INACTIVE      │◄──────────────┐
-        │        │  (withdrawn)     │               │
-        │        └─────────────────┘               │
-        │               │                          │
-        │         re-apply                    withdraw
-        │               ▼                          │
-        │        ┌──────────────┐                  │
-   withdraw      │   WAITLIST    │──────────────────┤
-        │        │  (queued)     │                  │
-        │        └──────┬───────┘                  │
-        │               │                          │
-        │          promote (auto)                   │
-        │               ▼                          │
-        │     ┌─────────────────────┐              │
-        ├─────│ PENDING_ACKNOWLEDGMENT│─────────────┤
-        │     │  (5 min deadline)    │              │
-        │     └────────┬──────┬─────┘              │
-        │              │      │                    │
-        │        acknowledge  expire (decay)        │
-        │              ▼      ▼                    │
-        │        ┌──────┐  ┌────────┐              │
-        └────────│ACTIVE│  │WAITLIST │ (with penalty)
-                 │      │  │ (back) │
-                 └──────┘  └────────┘
+                ┌──────────────┐
+    ┌──────────►│   INACTIVE   │◄────────────────┐
+    │           │  (withdrawn) │                 │
+    │           └──────────────┘                 │
+    │                  │                         │
+    │            re-apply (new app)          withdraw
+    │                  ▼                         │
+    │          ┌──────────────┐                  │
+  withdraw    │   WAITLIST   │──────────────────┤
+    │          │  (queued)    │                  │
+    │          └──────┬───────┘                  │
+    │                 │                          │
+    │         auto-promote                       │
+    │                 ▼                          │
+    │    ┌────────────────────────┐              │
+    ├────│  PENDING_ACKNOWLEDGMENT │─────────────┤
+    │    │   (5-min deadline)     │              │
+    │    └───────┬───────┬────────┘              │
+    │            │       │                       │
+    │       acknowledge  expire → decay          │
+    │            ▼       ▼                       │
+    │        ┌──────┐  ┌─────────┐              │
+    └────────│ACTIVE│  │WAITLIST │ (+ penalty)   │
+             └──────┘  └────────-┘               │
+                │                                │
+                └────────────────────────────────┘
 ```
 
 ### Valid Transitions
 
 | From | To | Trigger |
 |------|----|---------|
-| INACTIVE | ACTIVE | Apply (capacity available) |
-| INACTIVE | WAITLIST | Apply (capacity full) |
-| WAITLIST | PENDING_ACKNOWLEDGMENT | Auto-promotion |
+| — | ACTIVE | Apply (slot available) |
+| — | WAITLIST | Apply (job at capacity) |
+| WAITLIST | PENDING_ACKNOWLEDGMENT | Auto-promotion (slot opens) |
 | WAITLIST | INACTIVE | Withdraw |
-| PENDING_ACKNOWLEDGMENT | ACTIVE | Acknowledge |
-| PENDING_ACKNOWLEDGMENT | WAITLIST | Deadline expired (decay) |
+| PENDING_ACKNOWLEDGMENT | ACTIVE | Applicant acknowledges in time |
+| PENDING_ACKNOWLEDGMENT | WAITLIST | Deadline expires (decay + penalty) |
 | PENDING_ACKNOWLEDGMENT | INACTIVE | Withdraw |
-| ACTIVE | INACTIVE | Withdraw |
+| ACTIVE | INACTIVE | Withdraw / Remove from pipeline |
 
 ---
 
-## 🧪 Testing
+## Inactivity Decay Logic
+
+This is the most operationally complex part of the system. When an applicant is promoted to `PENDING_ACKNOWLEDGMENT`, they have a 5-minute window to respond. If they don't, the decay system handles it automatically.
+
+### How Decay Works (Step by Step)
+
+**1. Detection (every 5 seconds)**
+
+A background worker (`lib/decayWorker.ts`) polls the database every 5 seconds for any applications where:
+```sql
+status = 'PENDING_ACKNOWLEDGMENT'
+AND acknowledge_deadline < NOW()
+```
+
+It groups findings by job so each job's decay runs in its own transaction.
+
+**2. Penalty transition (per expired application)**
+
+Inside an atomic transaction:
+
+```
+PENDING_ACKNOWLEDGMENT → WAITLIST
+penaltyCount             +1
+promotedAt               → NULL
+acknowledgeDeadline      → NULL
+```
+
+The new queue position is calculated as:
+```
+position = MAX(current_positions) + 1 + penaltyCount
+```
+
+This means repeat offenders land further back on every missed deadline — deliberate game-theory pressure.
+
+**3. Cascade promotion**
+
+After decay removes one or more occupants from active/pending slots, `promoteUntilFull()` runs inside the same transaction. It repeatedly promotes the next waitlisted applicant (by position) until either the queue is empty or the job is back at capacity. Each promotion sets a new 5-minute acknowledgment deadline.
+
+**4. Audit trail**
+
+Every decayed application gets a `DECAY_TRIGGERED` log entry. Every promotion gets a `PROMOTED` entry. If the system crashes mid-cycle, re-running is safe — the state machine prevents double-transitions.
+
+**Important:** `EXPIRED` is **never a stored state**. There is no frozen application sitting in an expired limbo. Within 5 seconds of a deadline passing, the application is moved to `WAITLIST` and the next candidate is promoted. The UI may show a countdown reaching zero, but the database reflects the actual transitioned state.
+
+---
+
+## Concurrency Handling
+
+### The Problem
+
+If two applicants submit at exactly the same moment for a job with one remaining slot, both could independently read `activeCount = N-1 < capacity` and both proceed to insert an ACTIVE application — exceeding the job's limit.
+
+### The Solution
+
+**`getActiveCount()` uses `FOR UPDATE`:**
+
+```sql
+SELECT COUNT(*) as count
+FROM applications
+WHERE job_id = $1
+  AND status IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT')
+FOR UPDATE
+```
+
+The first transaction reaches this query and acquires an exclusive row lock. The second transaction blocks at this exact point. When the first commits (inserting an ACTIVE application), the second re-reads a count that now hits capacity — and correctly inserts a WAITLIST application instead.
+
+**`getNextInQueue()` uses `FOR UPDATE SKIP LOCKED`:**
+
+```sql
+SELECT application_id, position
+FROM queue_positions
+WHERE job_id = $1
+ORDER BY position
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+```
+
+`SKIP LOCKED` prevents two concurrent promotion calls from both selecting the same candidate. If the top row is already locked by another promotion, the second transaction skips it rather than blocking — making concurrent promotions safe at scale.
+
+**All state mutations run inside `db.transaction()`** with the `tx` handle propagated through the entire call chain — ensures no mixed-commit state between the capacity check and the application insert.
+
+---
+
+## Audit Logging
+
+Every status transition generates an immutable row in `audit_logs`:
+
+| Event | Trigger |
+|-------|---------|
+| `APPLIED` | Applicant submits an application |
+| `PROMOTED` | System promotes from WAITLIST → PENDING_ACKNOWLEDGMENT |
+| `ACKNOWLEDGED` | Applicant confirms their promotion |
+| `WITHDRAWN` | Applicant or company removes the application |
+| `DECAY_TRIGGERED` | Promotion deadline expires; applicant re-queued |
+
+Each log entry captures `fromStatus`, `toStatus`, `applicationId`, a `metadata` JSON blob (includes job ID, deadlines, penalty counts), and a `createdAt` timestamp.
+
+Because every transition is logged, the pipeline state at any historical timestamp can be reconstructed by replaying events up to that point. This is exposed via `GET /api/pipeline/:jobId/replay?asOf=ISO8601` — useful for audits or debugging.
+
+---
+
+## API Overview
+
+All endpoints are prefixed with `/api`.
+
+### Jobs
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/jobs` | List jobs with live active/waitlist counts |
+| `POST` | `/api/jobs` | Create a job with title, description, capacity |
+| `GET` | `/api/jobs/:jobId` | Job detail with active roster and waitlist |
+
+### Pipeline Actions
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/apply` | Apply (admin — requires applicantId) |
+| `POST` | `/api/apply-public` | Apply (public — name + email, find-or-create) |
+| `POST` | `/api/withdraw` | Withdraw an application (triggers promotion) |
+| `POST` | `/api/acknowledge` | Acknowledge a promotion within deadline |
+
+### Applicant Views
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/status/:id` | All applications + queue positions for an applicant |
+| `GET` | `/api/timeline/:id` | Full audit event timeline for an applicant |
+
+### Analytics
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/queue/:jobId` | Ordered waitlist for a job |
+| `GET` | `/api/pipeline/:jobId/summary` | Stats: counts, avg times, decay events |
+| `GET` | `/api/pipeline/:jobId/replay` | Reconstruct pipeline state at a past timestamp |
+
+### Error Format
+
+All errors follow a consistent structure:
+
+```json
+{
+  "error": {
+    "message": "Applicant 3 already has an active application for job 7",
+    "code": "DUPLICATE_SUBMISSION"
+  }
+}
+```
+
+Machine-readable `code` fields (`NOT_FOUND`, `CONFLICT`, `GONE`, `INVALID_TRANSITION`, etc.) allow the frontend to handle errors precisely without string parsing.
+
+---
+
+## Frontend Strategy
+
+The frontend is **not real-time**. It uses React Query's refetch-on-focus and manual refresh rather than WebSockets or Server-sent Events.
+
+**Why:** A hiring pipeline doesn't need sub-second updates. An applicant checking their queue position tolerates a few seconds of latency. The added complexity of persistent WebSocket connections — connection management, reconnection logic, server-side broadcasting — is not justified for this use case.
+
+**What this means in practice:**
+
+- After submitting an application, the applicant is redirected to their dashboard which fetches fresh data
+- After withdrawing, the UI optimistically updates and invalidates the relevant React Query cache key
+- The company pipeline view refreshes on navigation and on explicit user actions
+- The 5-second decay worker on the server means that even if a user is watching a countdown, the next page load will reflect the correct decayed state
+
+If real-time updates become a requirement, the backend already emits enough structured events (audit logs) to support a `change data capture → SSE` pattern without architectural changes.
+
+---
+
+## Design Tradeoffs
+
+| Decision | Chosen | Alternative | Reason |
+|----------|--------|-------------|--------|
+| **Frontend updates** | Polling / refetch | WebSockets / SSE | Lower complexity; adequate for hiring pipeline latency needs |
+| **Decay trigger** | 5s background interval | PostgreSQL cron / triggers | Logic stays in application layer, fully unit-testable, no DB extension dependencies |
+| **Concurrency** | Pessimistic locking (`FOR UPDATE`) | Optimistic locking (version column + retry) | Simpler to reason about; no retry loop needed; correct for the "last slot" scenario |
+| **Queue reindex** | Single `UPDATE … FROM CTE` with `ROW_NUMBER()` | Loop-based N+1 updates | O(1) queries vs O(n); scales to large waitlists |
+| **Schema validation** | Zod on every route (middleware) | Runtime duck-typing | Catches bad input at the boundary; consistent 400 error format |
+| **State transitions** | Centralized adjacency map + `assertValidTransition()` | Ad-hoc per-service checks | Single source of truth; impossible to accidentally create an illegal state |
+| **Error handling** | Typed error class hierarchy | Generic `Error` + status codes | Structured JSON output without switch statements; easy to add new error types |
+| **Applicant identity** | Email-based find-or-create | Email + password auth | Zero friction for applicants; no auth layer to maintain in a pipeline demo |
+
+---
+
+## Performance Considerations
+
+**Queue reindex is O(1) queries.**
+After promoting a candidate, the queue needs to be renumbered. This is done with a single `UPDATE … FROM` statement using a `ROW_NUMBER() OVER (ORDER BY position)` CTE — one round-trip regardless of queue length. The previous loop-based approach sent N individual UPDATE queries.
+
+**Capacity check is a single locked COUNT.**
+`getActiveCount()` runs one `SELECT COUNT(*) … FOR UPDATE` inside the transaction. No individual row fetches, no application-level counting.
+
+**Decay worker is lightweight.**
+It only runs if there are expired `PENDING_ACKNOWLEDGMENT` rows. If the queue is empty or no deadlines have passed, the query returns zero rows and the worker exits the cycle in microseconds.
+
+**Transactions are scoped tightly.**
+Transactions wrap only the state-changing operations, not the validation reads. `getNextInQueue()` with `SKIP LOCKED` means concurrent promotions don't serialize on each other unnecessarily.
+
+---
+
+## Future Improvements
+
+- **Real-time updates** — The audit log already captures every state change. A CDC (Change Data Capture) → Server-Sent Events pipeline could give applicants live queue position updates without polling.
+- **Configurable acknowledgment window** — Currently hardcoded at 5 minutes per job. Could be a per-job setting stored in the `jobs` table.
+- **Email/SMS notifications** — On promotion, send the applicant a notification with a direct acknowledgment link rather than requiring them to check the dashboard.
+- **Batch decay processing** — If thousands of jobs exist, the decay worker could process them in parallel (e.g., `Promise.all`) rather than serially.
+- **Rate limiting** — The public `/apply-public` endpoint has no rate limiting, which is the right call for a demo but would need throttling in production.
+- **Admin authentication** — The company dashboard currently has no authentication. A simple session-based or JWT auth layer would be needed for real deployment.
+
+---
+
+## Setup Instructions
+
+### Prerequisites
+
+| Tool | Version |
+|------|---------|
+| Node.js | ≥ 20 |
+| pnpm | ≥ 9 |
+| PostgreSQL | ≥ 15 |
+
+### 1. Install
 
 ```bash
-# Run all tests
+git clone <repo-url>
+cd hiring-pipeline
+pnpm install
+```
+
+### 2. Configure environment
+
+**Root `.env`** (used by Drizzle migrations):
+```env
+DATABASE_URL=postgresql://postgres:password@localhost:5432/hiring_pipeline
+```
+
+**`artifacts/api-server/.env`** (used by the API server):
+```env
+DATABASE_URL=postgresql://postgres:password@localhost:5432/hiring_pipeline
+PORT=5000
+```
+
+### 3. Create the database
+
+```bash
+# In psql:
+CREATE DATABASE hiring_pipeline;
+```
+
+### 4. Push schema
+
+```bash
+pnpm --filter @workspace/db push
+```
+
+### 5. Start the API server
+
+```bash
+pnpm --filter @workspace/api-server dev
+```
+
+You should see:
+```
+Server listening { port: 5000 }
+Starting inactivity decay worker { intervalMs: 5000 }
+```
+
+### 6. Start the frontend
+
+```bash
+# In a separate terminal:
+pnpm --filter @workspace/hiring-pipeline dev
+```
+
+Open **http://localhost:5173**
+
+### 7. Seed sample data (optional)
+
+```bash
+node scripts/seed.mjs
+```
+
+Creates 3 jobs, 5 applicants, and sample applications.
+
+### 8. Run tests
+
+```bash
 pnpm test
-
-# Run with watch mode
-pnpm --filter @workspace/api-server test:watch
 ```
 
-### Test Suites
-
-| Suite | Tests | Coverage |
-|-------|-------|----------|
-| `stateMachine.test.ts` | 16 | All valid/invalid transitions, immutability |
-| `errors.test.ts` | 12 | Error classes, status codes, JSON format |
-| `errorHandler.test.ts` | 10 | Middleware, PG constraint mapping (23505, 23503) |
-| `concurrency.test.ts` | 20 | Race conditions, edge cases, duplicate detection |
-| `businessLogic.test.ts` | 13 | Service functions with mocked DB |
-| `validate.test.ts` | 5 | Validation middleware |
+Runs all Vitest suites: state machine, error classes, validation middleware, business logic, concurrency, and error handler.
 
 ---
 
-## 🔒 Concurrency Safety
+## Test Coverage
 
-All capacity-critical operations use PostgreSQL row-level locking:
-
-- **`FOR UPDATE`** on `getActiveCount()` — locks application rows during capacity checks, preventing two concurrent `/apply` requests from both getting active slots when only one is available
-- **`FOR UPDATE SKIP LOCKED`** on `getNextInQueue()` — safely selects the next waitlist candidate without blocking other concurrent promotions; skips rows already locked by another transaction
-- **All state mutations** run inside `db.transaction()` with the `tx` parameter propagated through the entire call chain, ensuring reads and writes are always transactionally consistent
-- **Duplicate detection** — before inserting a new application, existing active applications are checked within the same transaction to prevent double-submission
-
-### Concurrency Test Scenario
-
-```
-Job capacity = 1 (1 active slot)
-Two users apply simultaneously:
-  Thread A: reads activeCount = 0, acquires FOR UPDATE lock
-  Thread B: reads activeCount = 0, BLOCKS waiting for lock
-  Thread A: inserts ACTIVE application, commits
-  Thread B: lock released, re-reads activeCount = 1 → inserts WAITLIST
-Result: exactly 1 ACTIVE, 1 WAITLIST — no double-booking
-```
+| Suite | What It Tests |
+|-------|--------------|
+| `stateMachine.test.ts` | All valid/invalid transitions, immutability of transition results |
+| `errors.test.ts` | Error class hierarchy, status codes, JSON serialization |
+| `errorHandler.test.ts` | Middleware behavior, PostgreSQL constraint code mapping |
+| `concurrency.test.ts` | Race conditions, duplicate detection, capacity edge cases |
+| `businessLogic.test.ts` | Service functions with mocked DB |
+| `validate.test.ts` | Zod validation middleware, error format |
 
 ---
 
-## ⏱️ Inactivity Decay Logic
-
-The decay system automatically handles applicants who fail to acknowledge a promotion:
-
-### Trigger Condition
-```
-status = 'PENDING_ACKNOWLEDGMENT' AND acknowledgeDeadline < NOW()
-```
-
-### Decay Sequence (atomic transaction per job)
-
-1. **Detect** — background worker queries for expired `PENDING_ACKNOWLEDGMENT` rows every 5 seconds
-2. **Penalize** — `PENDING_ACKNOWLEDGMENT → WAITLIST` with `penaltyCount++`
-3. **Re-queue at back** — new waitlist position = `MAX(position) + 1 + penaltyCount` (penalty pushes further back on repeat offenses)
-4. **Clear state** — `promotedAt`, `acknowledgeDeadline` both set to `NULL`
-5. **Cascade promote** — fills all vacated slots by promoting next WAITLIST candidates to `PENDING_ACKNOWLEDGMENT` with fresh 5-minute deadlines
-6. **Audit log** — `DECAY_TRIGGERED` event recorded for every decayed application
-
-### Important: No "EXPIRED" State
-
-`EXPIRED` is **never stored** in the database. It only exists as a transient UI concept. The moment a deadline passes and the worker runs, the status immediately transitions to `WAITLIST`. There is no frozen/stuck state.
-
----
-
-## ⚖️ Design Tradeoffs
-
-| Decision | Chosen Approach | Alternative | Reason |
-|----------|----------------|-------------|--------|
-| **Real-time updates** | Polling (React Query refetch) | WebSockets / SSE | Simpler, no persistent connection management; acceptable for hiring pipeline latency |
-| **Decay trigger** | Background interval (5s poll) | DB triggers / cron | Keeps logic in application layer, fully testable, no DB-specific extensions |
-| **Concurrency** | `FOR UPDATE` row locking | Optimistic locking / SKIP LOCKED everywhere | Pessimistic locking is safer for the final slot scenario; simpler to reason about |
-| **State machine** | Centralized adjacency map | Distributed checks per service | Single source of truth; all illegal transitions throw before any DB write |
-| **Queue ordering** | Position integer + re-index on promote | Linked list / priority queue | Simple to query, easy to reason about, re-indexing cost is acceptable at pipeline scale |
-| **Error format** | `{ error: { message, code } }` | HTTP status only | Machine-readable codes enable precise frontend handling without parsing strings |
-
----
-
-## 🛠️ Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| **Frontend** | React 19, Vite, TailwindCSS 4, Radix UI, Wouter, React Query |
-| **Backend** | Node.js, Express 5, TypeScript |
-| **Database** | PostgreSQL, Drizzle ORM |
-| **Validation** | Zod (shared schemas) |
-| **Testing** | Vitest |
-| **Logging** | Pino + pino-pretty |
-| **Build** | ESBuild, pnpm workspaces |
-
----
-
-## 📁 Key Design Decisions
-
-1. **Service Layer Pattern** — Routes are thin wrappers (parse → call service → respond). All business logic lives in `services/applicationService.ts` and `services/pipeline.ts`.
-
-2. **Pure Result Objects** — Service functions return new objects, never mutating inputs. Makes the code predictable and testable.
-
-3. **Centralized State Machine** — `lib/stateMachine.ts` defines the ONLY legal transitions. Every status change is validated through `assertValidTransition()`.
-
-4. **Structured Error Hierarchy** — Custom `AppError` subclasses (`NotFoundError`, `ConflictError`, `GoneError`, `InvalidTransitionError`) with consistent JSON output.
-
-5. **Global Error Handler** — Express middleware that catches errors, maps PostgreSQL constraint codes (23505, 23503, etc.) to proper HTTP responses, and ensures no unstructured errors leak to clients.
-
-6. **Transaction Safety** — Every state-changing operation uses `FOR UPDATE` locking inside transactions. The `tx` parameter is dependency-injected through the call chain to ensure all reads/writes are transactionally consistent.
-
----
-
-## 📜 License
+## License
 
 MIT
