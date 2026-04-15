@@ -4,22 +4,39 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 
+// Landing
+import LandingPage from "@/pages/landing";
+
+// Admin (Company) pages
 import Dashboard from "@/pages/dashboard";
 import ApplicantRegistry from "@/pages/applicant-registry";
 import JobPipeline from "@/pages/job-pipeline";
 import ApplicantDetail from "@/pages/applicant-detail";
 import PipelineReplay from "@/pages/pipeline-replay";
 
+// Applicant (Public) pages
+import ApplyPage from "@/pages/apply";
+import CheckStatusPage from "@/pages/check-status";
+
 const queryClient = new QueryClient();
 
 function Router() {
   return (
     <Switch>
-      <Route path="/" component={Dashboard} />
+      {/* Landing — role selection */}
+      <Route path="/" component={LandingPage} />
+
+      {/* Admin routes */}
+      <Route path="/dashboard" component={Dashboard} />
       <Route path="/applicants" component={ApplicantRegistry} />
       <Route path="/applicants/:applicantId" component={ApplicantDetail} />
       <Route path="/jobs/:jobId" component={JobPipeline} />
       <Route path="/pipeline/:jobId/replay" component={PipelineReplay} />
+
+      {/* Applicant routes */}
+      <Route path="/apply" component={ApplyPage} />
+      <Route path="/status" component={CheckStatusPage} />
+
       <Route component={NotFound} />
     </Switch>
   );

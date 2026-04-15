@@ -17,7 +17,7 @@ A **production-grade, full-stack hiring pipeline** built with the PERN stack (Po
 | **Decay & Penalty System** | Expired promotions trigger a penalty and re-queue at the back |
 | **Audit Log & Replay** | Every state change is logged; pipeline state can be reconstructed at any past timestamp |
 | **Concurrency-Safe** | `FOR UPDATE` row-level locking prevents race conditions |
-| **Background Decay Worker** | Polls for expired acknowledgments every 30 seconds |
+| **Background Decay Worker** | Polls for expired acknowledgments every 5 seconds |
 
 ---
 
@@ -139,7 +139,7 @@ This builds and starts the Express API at **http://localhost:5000**. You should 
 
 ```
 Server listening { port: 5000 }
-Decay worker started (interval: 30s)
+Decay worker started (interval: 5s)
 ```
 
 ### Step 6 — Start the Frontend
@@ -327,9 +327,59 @@ pnpm --filter @workspace/api-server test:watch
 
 All capacity-critical operations use PostgreSQL row-level locking:
 
-- **`FOR UPDATE`** on `getActiveCount()` — locks application rows during capacity checks, preventing two concurrent `/apply` requests from both getting active slots
-- **`FOR UPDATE SKIP LOCKED`** on `getNextInQueue()` — safely promotes from the queue without blocking concurrent promotions
-- **All state mutations** run inside `db.transaction()` with the `tx` parameter propagated through the entire call chain
+- **`FOR UPDATE`** on `getActiveCount()` — locks application rows during capacity checks, preventing two concurrent `/apply` requests from both getting active slots when only one is available
+- **`FOR UPDATE SKIP LOCKED`** on `getNextInQueue()` — safely selects the next waitlist candidate without blocking other concurrent promotions; skips rows already locked by another transaction
+- **All state mutations** run inside `db.transaction()` with the `tx` parameter propagated through the entire call chain, ensuring reads and writes are always transactionally consistent
+- **Duplicate detection** — before inserting a new application, existing active applications are checked within the same transaction to prevent double-submission
+
+### Concurrency Test Scenario
+
+```
+Job capacity = 1 (1 active slot)
+Two users apply simultaneously:
+  Thread A: reads activeCount = 0, acquires FOR UPDATE lock
+  Thread B: reads activeCount = 0, BLOCKS waiting for lock
+  Thread A: inserts ACTIVE application, commits
+  Thread B: lock released, re-reads activeCount = 1 → inserts WAITLIST
+Result: exactly 1 ACTIVE, 1 WAITLIST — no double-booking
+```
+
+---
+
+## ⏱️ Inactivity Decay Logic
+
+The decay system automatically handles applicants who fail to acknowledge a promotion:
+
+### Trigger Condition
+```
+status = 'PENDING_ACKNOWLEDGMENT' AND acknowledgeDeadline < NOW()
+```
+
+### Decay Sequence (atomic transaction per job)
+
+1. **Detect** — background worker queries for expired `PENDING_ACKNOWLEDGMENT` rows every 5 seconds
+2. **Penalize** — `PENDING_ACKNOWLEDGMENT → WAITLIST` with `penaltyCount++`
+3. **Re-queue at back** — new waitlist position = `MAX(position) + 1 + penaltyCount` (penalty pushes further back on repeat offenses)
+4. **Clear state** — `promotedAt`, `acknowledgeDeadline` both set to `NULL`
+5. **Cascade promote** — fills all vacated slots by promoting next WAITLIST candidates to `PENDING_ACKNOWLEDGMENT` with fresh 5-minute deadlines
+6. **Audit log** — `DECAY_TRIGGERED` event recorded for every decayed application
+
+### Important: No "EXPIRED" State
+
+`EXPIRED` is **never stored** in the database. It only exists as a transient UI concept. The moment a deadline passes and the worker runs, the status immediately transitions to `WAITLIST`. There is no frozen/stuck state.
+
+---
+
+## ⚖️ Design Tradeoffs
+
+| Decision | Chosen Approach | Alternative | Reason |
+|----------|----------------|-------------|--------|
+| **Real-time updates** | Polling (React Query refetch) | WebSockets / SSE | Simpler, no persistent connection management; acceptable for hiring pipeline latency |
+| **Decay trigger** | Background interval (5s poll) | DB triggers / cron | Keeps logic in application layer, fully testable, no DB-specific extensions |
+| **Concurrency** | `FOR UPDATE` row locking | Optimistic locking / SKIP LOCKED everywhere | Pessimistic locking is safer for the final slot scenario; simpler to reason about |
+| **State machine** | Centralized adjacency map | Distributed checks per service | Single source of truth; all illegal transitions throw before any DB write |
+| **Queue ordering** | Position integer + re-index on promote | Linked list / priority queue | Simple to query, easy to reason about, re-indexing cost is acceptable at pipeline scale |
+| **Error format** | `{ error: { message, code } }` | HTTP status only | Machine-readable codes enable precise frontend handling without parsing strings |
 
 ---
 

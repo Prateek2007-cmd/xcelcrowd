@@ -4,7 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import { logger } from "./logger";
 import { checkAndDecayExpiredAcknowledgments } from "../services/pipeline";
 
-const POLL_INTERVAL_MS = 30_000;
+const POLL_INTERVAL_MS = 5_000;
 
 async function runDecayCycle(): Promise<void> {
   try {

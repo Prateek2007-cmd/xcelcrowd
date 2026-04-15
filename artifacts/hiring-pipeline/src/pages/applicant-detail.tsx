@@ -2,18 +2,13 @@ import { useParams, Link } from "wouter";
 import { useQueryClient } from "@tanstack/react-query";
 import { format } from "date-fns";
 import { ArrowLeft, Briefcase, PlayCircle, CheckCircle, XCircle } from "lucide-react";
-import { z } from "zod";
-import { useForm } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
 
 import {
   useGetApplicant,
   useGetApplicantStatus,
   useGetApplicantTimeline,
-  useApplyToJob,
   useWithdrawApplication,
   useAcknowledgePromotion,
-  useListJobs,
   getGetApplicantStatusQueryKey,
   getGetApplicantTimelineQueryKey,
 } from "@workspace/api-client-react";
@@ -24,28 +19,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusBadge } from "@/components/status-badge";
 import { Countdown } from "@/components/countdown";
 import { Separator } from "@/components/ui/separator";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-
-const applySchema = z.object({
-  jobId: z.string().min(1, "Please select a job"),
-});
-
-type ApplyFormValues = z.infer<typeof applySchema>;
 
 export default function ApplicantDetail() {
   const { applicantId } = useParams<{ applicantId: string }>();
@@ -63,35 +37,9 @@ export default function ApplicantDetail() {
   const { data: timeline, isLoading: timelineLoading } = useGetApplicantTimeline(id, {
     query: { enabled: !!id },
   });
-  const { data: jobs } = useListJobs();
 
-  const applyMutation = useApplyToJob();
   const withdrawMutation = useWithdrawApplication();
   const acknowledgeMutation = useAcknowledgePromotion();
-
-  const form = useForm<ApplyFormValues>({
-    resolver: zodResolver(applySchema),
-    defaultValues: {
-      jobId: "",
-    },
-  });
-
-  const onApply = (values: ApplyFormValues) => {
-    applyMutation.mutate(
-      { data: { applicantId: id, jobId: parseInt(values.jobId, 10) } },
-      {
-        onSuccess: () => {
-          queryClient.invalidateQueries({ queryKey: getGetApplicantStatusQueryKey(id) });
-          queryClient.invalidateQueries({ queryKey: getGetApplicantTimelineQueryKey(id) });
-          toast({ title: "Applied successfully" });
-          form.reset();
-        },
-        onError: () => {
-          toast({ title: "Application failed", variant: "destructive" });
-        },
-      }
-    );
-  };
 
   const handleWithdraw = (applicationId: number) => {
     withdrawMutation.mutate(
@@ -148,10 +96,6 @@ export default function ApplicantDetail() {
     );
   }
 
-  const unappliedJobs = jobs?.filter(
-    (j) => !statusData.applications.some((app) => app.jobId === j.id && app.status !== "INACTIVE")
-  ) || [];
-
   return (
     <Layout>
       <div className="space-y-6">
@@ -167,8 +111,7 @@ export default function ApplicantDetail() {
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          <div className="lg:col-span-2 space-y-6">
+        <div className="space-y-6">
             <Card className="border-border/50">
               <CardHeader>
                 <CardTitle className="text-lg flex items-center gap-2">
@@ -220,7 +163,7 @@ export default function ApplicantDetail() {
                                 onClick={() => handleWithdraw(app.applicationId)}
                                 disabled={withdrawMutation.isPending}
                               >
-                                <XCircle className="mr-2 h-4 w-4" /> Withdraw
+                                <XCircle className="mr-2 h-4 w-4" /> Remove from Pipeline
                               </Button>
                             )}
                           </div>
@@ -284,55 +227,6 @@ export default function ApplicantDetail() {
                 </div>
               </CardContent>
             </Card>
-          </div>
-
-          <div className="space-y-6">
-            <Card className="border-primary/20 bg-primary/5">
-              <CardHeader>
-                <CardTitle className="text-lg text-primary">Apply to Job</CardTitle>
-              </CardHeader>
-              <CardContent>
-                <Form {...form}>
-                  <form onSubmit={form.handleSubmit(onApply)} className="space-y-4">
-                    <FormField
-                      control={form.control}
-                      name="jobId"
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Select Job</FormLabel>
-                          <Select onValueChange={field.onChange} defaultValue={field.value}>
-                            <FormControl>
-                              <SelectTrigger>
-                                <SelectValue placeholder="Choose a job..." />
-                              </SelectTrigger>
-                            </FormControl>
-                            <SelectContent>
-                              {unappliedJobs.map((job) => (
-                                <SelectItem key={job.id} value={job.id.toString()}>
-                                  {job.title}
-                                </SelectItem>
-                              ))}
-                              {unappliedJobs.length === 0 && (
-                                <SelectItem value="none" disabled>No available jobs</SelectItem>
-                              )}
-                            </SelectContent>
-                          </Select>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                    <Button 
-                      type="submit" 
-                      className="w-full" 
-                      disabled={applyMutation.isPending || unappliedJobs.length === 0}
-                    >
-                      {applyMutation.isPending ? "Applying..." : "Submit Application"}
-                    </Button>
-                  </form>
-                </Form>
-              </CardContent>
-            </Card>
-          </div>
         </div>
       </div>
     </Layout>
