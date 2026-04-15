@@ -234,6 +234,19 @@ FOR UPDATE SKIP LOCKED
 
 **All state mutations run inside `db.transaction()`** with the `tx` handle propagated through the entire call chain — ensures no mixed-commit state between the capacity check and the application insert.
 
+### Concurrency Validation
+
+The core locking strategy is validated in `concurrency.test.ts`, which tests:
+
+- Duplicate application detection within the same transaction
+- Capacity boundary enforcement (N applicants for a job with capacity N-1)
+- State machine rejection of illegal concurrent transitions
+- getActiveCount returning correct values under mocked contention scenarios
+
+**Known limitation:** The test suite mocks the database layer, which means it validates application-level logic but does not exercise actual PostgreSQL lock acquisition. True DB-level race conditions (two real concurrent connections racing on the same row) are not covered by the current suite.
+
+**Path to full validation:** Integration tests using `Promise.all` to fire simultaneous requests against a live test database would validate that `FOR UPDATE` actually prevents double-booking under real PostgreSQL contention. This is the natural next step before a load-test environment.
+
 ---
 
 ## Audit Logging
@@ -351,6 +364,39 @@ Transactions wrap only the state-changing operations, not the validation reads. 
 
 ---
 
+## Background Worker Design
+
+The decay worker (`lib/decayWorker.ts`) uses a `setInterval` loop polling every 5 seconds. On each tick it:
+
+1. Queries for any job that has at least one expired `PENDING_ACKNOWLEDGMENT` row
+2. Runs the full decay + cascade promotion cycle for each affected job inside its own transaction
+3. Logs results and exits; the next tick starts fresh regardless of what happened
+
+### Why polling over event-driven
+
+A `setInterval`-based approach was chosen deliberately over DB triggers or an external scheduler for two reasons:
+
+- **Testability** — The decay logic lives in `pipeline.ts` as a pure service function. It can be called directly in tests without spinning up a cron daemon or mocking DB events.
+- **No external dependencies** — No Redis, no BullMQ, no pg_cron. The system installs and runs with just Node + PostgreSQL.
+
+### Tradeoffs
+
+| Aspect | Current Behaviour | Implication |
+|--------|-------------------|-------------|
+| Timing precision | ±5 seconds | Acceptable for a 5-minute acknowledgment window; not suitable for sub-second SLAs |
+| Guaranteed execution | Best-effort | A long-running previous tick could delay the next; heavy load can cause drift |
+| Horizontal scaling | Single process | Two instances of the API server would both run the worker, causing duplicate decay attempts (mitigated by the state machine rejecting already-transitioned rows, but wasteful) |
+
+### Path to production-grade scheduling
+
+For a multi-instance or high-throughput deployment:
+
+- Replace `setInterval` with **BullMQ** or **pg-boss** — both support distributed locks so only one worker processes a given job at a time
+- Alternatively, use **PostgreSQL advisory locks** (`pg_try_advisory_lock`) to elect a single leader among instances before each decay cycle
+- Add a dead-man's switch: alert if the decay worker hasn't logged a successful cycle within 30 seconds
+
+---
+
 ## Future Improvements
 
 - **Real-time updates** — The audit log already captures every state change. A CDC (Change Data Capture) → Server-Sent Events pipeline could give applicants live queue position updates without polling.
@@ -359,6 +405,7 @@ Transactions wrap only the state-changing operations, not the validation reads. 
 - **Batch decay processing** — If thousands of jobs exist, the decay worker could process them in parallel (e.g., `Promise.all`) rather than serially.
 - **Rate limiting** — The public `/apply-public` endpoint has no rate limiting, which is the right call for a demo but would need throttling in production.
 - **Admin authentication** — The company dashboard currently has no authentication. A simple session-based or JWT auth layer would be needed for real deployment.
+- **Distributed worker** — Replace `setInterval` with BullMQ or pg-boss to safely run the decay worker across multiple API server instances.
 
 ---
 
@@ -445,16 +492,38 @@ Runs all Vitest suites: state machine, error classes, validation middleware, bus
 
 ---
 
-## Test Coverage
+---
 
-| Suite | What It Tests |
-|-------|--------------|
-| `stateMachine.test.ts` | All valid/invalid transitions, immutability of transition results |
-| `errors.test.ts` | Error class hierarchy, status codes, JSON serialization |
-| `errorHandler.test.ts` | Middleware behavior, PostgreSQL constraint code mapping |
-| `concurrency.test.ts` | Race conditions, duplicate detection, capacity edge cases |
-| `businessLogic.test.ts` | Service functions with mocked DB |
-| `validate.test.ts` | Zod validation middleware, error format |
+## Testing Strategy
+
+### Philosophy
+
+The test suite is designed around a layered validation model — each layer tests a single concern in isolation, which makes failures obvious and fixes targeted.
+
+| Suite | Layer | What It Tests |
+|-------|-------|---------------|
+| `stateMachine.test.ts` | Pure logic | All valid/invalid transitions, immutability of transition result objects |
+| `errors.test.ts` | Pure logic | Error class hierarchy, HTTP status codes, JSON serialization format |
+| `errorHandler.test.ts` | Middleware | Express error handler, PostgreSQL constraint code mapping (23505, 23503) |
+| `validate.test.ts` | Middleware | Zod validation middleware, error format on bad input |
+| `businessLogic.test.ts` | Service | applyToJob, withdrawApplication, acknowledgePromotion with mocked DB |
+| `concurrency.test.ts` | Service | Race condition logic, duplicate detection, capacity boundary cases |
+
+Pure logic tests (`stateMachine`, `errors`) have no external dependencies and run in milliseconds. Service tests mock the DB layer to keep them fast and deterministic — not because integration matters less, but because unit correctness is a prerequisite for integration correctness.
+
+### Limitations
+
+**Assertion density** — Some suites test the happy path thoroughly but have thinner coverage of error branches (e.g., what happens if the DB throws mid-transaction). These paths are covered by the global error handler but are not individually exercised.
+
+**Concurrency testing is logic-level, not DB-level** — `concurrency.test.ts` validates that the application code makes the right decisions given controlled inputs. It does not spin up two real PostgreSQL connections and race them against each other, so actual lock acquisition is not exercised in CI.
+
+**No end-to-end tests** — There are no browser-level or HTTP-level integration tests. The API is validated through service-level tests only.
+
+### Improvements Planned
+
+- **Concurrent DB integration tests** — Use `Promise.all` to fire simultaneous `POST /api/apply` requests against a real test database and assert that exactly N applications become ACTIVE for a job with capacity N. This would validate that `FOR UPDATE` works as expected under real contention.
+- **Increased error branch coverage** — Add explicit test cases for mid-transaction DB failures, constraint violation propagation, and `GoneError` on expired acknowledgment windows.
+- **Contract tests** — Use the OpenAPI specification in `lib/api-spec` to validate that every endpoint response matches its declared schema.
 
 ---
 
