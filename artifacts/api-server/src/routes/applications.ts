@@ -4,7 +4,6 @@
  */
 import { Router, type IRouter } from "express";
 import { eq } from "drizzle-orm";
-import { z } from "zod";
 import { db } from "@workspace/db";
 import { applicantsTable } from "@workspace/db";
 import {
@@ -13,6 +12,7 @@ import {
   AcknowledgePromotionBody,
 } from "@workspace/api-zod";
 import { validateBody } from "../middlewares/validate";
+import { PublicApplyBody } from "../schemas/application";
 import {
   applyToJob,
   withdrawApplication,
@@ -46,18 +46,6 @@ router.post("/acknowledge", validateBody(AcknowledgePromotionBody), async (req, 
   } catch (err) {
     next(err);
   }
-});
-
-/**
- * Public apply endpoint — handles full flow in one call:
- * 1. Find existing applicant by email OR create new one
- * 2. Apply to the specified job
- * No authentication required.
- */
-const PublicApplyBody = z.object({
-  name: z.string().min(1),
-  email: z.string().email(),
-  jobId: z.number().int().positive(),
 });
 
 router.post("/apply-public", validateBody(PublicApplyBody), async (req, res, next): Promise<void> => {

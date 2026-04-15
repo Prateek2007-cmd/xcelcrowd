@@ -5,7 +5,7 @@ import {
   auditLogsTable,
   type ApplicationStatus,
 } from "@workspace/db";
-import { eq, and, sql, asc } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const ACKNOWLEDGE_WINDOW_MS = 5 * 60 * 1000;
@@ -143,20 +143,20 @@ export async function promoteUntilFull(
 }
 
 export async function reindexQueue(jobId: number, tx: typeof db = db): Promise<void> {
-  const rows = await tx
-    .select({
-      applicationId: queuePositionsTable.applicationId,
-    })
-    .from(queuePositionsTable)
-    .where(eq(queuePositionsTable.jobId, jobId))
-    .orderBy(asc(queuePositionsTable.position));
-
-  for (let i = 0; i < rows.length; i++) {
-    await tx
-      .update(queuePositionsTable)
-      .set({ position: i + 1 })
-      .where(eq(queuePositionsTable.applicationId, rows[i].applicationId));
-  }
+  // Single bulk UPDATE via CTE — O(1) queries regardless of queue size.
+  // Assigns sequential positions (1, 2, 3, …) ordered by the current position value.
+  await tx.execute(sql`
+    WITH ranked AS (
+      SELECT application_id,
+             ROW_NUMBER() OVER (ORDER BY position) AS new_pos
+      FROM   ${queuePositionsTable}
+      WHERE  ${queuePositionsTable.jobId} = ${jobId}
+    )
+    UPDATE ${queuePositionsTable}
+    SET    position = ranked.new_pos
+    FROM   ranked
+    WHERE  ${queuePositionsTable.applicationId} = ranked.application_id
+  `);
 }
 
 export async function applyPenaltyAndRequeue(
