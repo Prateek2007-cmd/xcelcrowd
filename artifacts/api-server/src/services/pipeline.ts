@@ -24,14 +24,19 @@ const ACKNOWLEDGE_WINDOW_MS = 5 * 60 * 1000;
  *
  * MUST be called inside an open transaction (pass the `tx` handle).
  */
-export async function getActiveCount(jobId: number, tx: typeof db = db): Promise<number> {
-  const result = await tx.execute<{ count: string }>(sql`
-    SELECT COUNT(*) as count
+export async function getActiveCount(
+  jobId: number,
+  tx: typeof db = db
+): Promise<number> {
+  const rows = await tx.execute(sql`
+    SELECT ${applicationsTable.id}
     FROM ${applicationsTable}
     WHERE ${applicationsTable.jobId} = ${jobId}
       AND ${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT')
+    FOR UPDATE
   `);
-  return Number(result.rows?.[0]?.count ?? 0);
+
+  return rows.rows.length;
 }
 
 /**
