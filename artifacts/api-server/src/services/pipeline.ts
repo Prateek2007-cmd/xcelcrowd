@@ -30,7 +30,6 @@ export async function getActiveCount(jobId: number, tx: typeof db = db): Promise
     FROM ${applicationsTable}
     WHERE ${applicationsTable.jobId} = ${jobId}
       AND ${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT')
-    FOR UPDATE
   `);
   return Number(result.rows?.[0]?.count ?? 0);
 }
