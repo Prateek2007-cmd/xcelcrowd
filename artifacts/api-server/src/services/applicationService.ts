@@ -322,7 +322,7 @@ export async function acknowledgePromotion(applicationId: number): Promise<Ackno
 }
 /**
  * Public apply flow:
- * - Find or create applicant
+ * - Atomic applicant creation (no race condition)
  * - Apply to job
  */
 export async function applyPublic(
@@ -330,23 +330,32 @@ export async function applyPublic(
   email: string,
   jobId: number
 ) {
-  // reuse existing service
-  const [existing] = await db
-    .select()
-    .from(applicantsTable)
-    .where(eq(applicantsTable.email, email));
-
   let applicantId: number;
 
-  if (existing) {
-    applicantId = existing.id;
-  } else {
+  try {
+    // Try inserting directly (atomic operation)
     const [created] = await db
       .insert(applicantsTable)
       .values({ name, email })
       .returning();
 
     applicantId = created.id;
+  } catch (err: any) {
+    // Handle duplicate email (unique constraint)
+    if (err.code === "23505") {
+      const [existing] = await db
+        .select()
+        .from(applicantsTable)
+        .where(eq(applicantsTable.email, email));
+
+      if (!existing) {
+        throw err; // safety fallback
+      }
+
+      applicantId = existing.id;
+    } else {
+      throw err;
+    }
   }
 
   return applyToJob(applicantId, jobId);
