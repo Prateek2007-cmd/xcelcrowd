@@ -65,8 +65,20 @@ export async function listJobs(): Promise<JobListItem[]> {
       description: jobsTable.description,
       capacity: jobsTable.capacity,
       createdAt: jobsTable.createdAt,
-      activeCount: sql<number>`COUNT(*) FILTER (WHERE ${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT'))`,
-      waitlistCount: sql<number>`COUNT(*) FILTER (WHERE ${applicationsTable.status} = 'WAITLIST')`,
+      /**
+ * Uses single aggregated query (LEFT JOIN + GROUP BY)
+ * to avoid N+1 queries when listing jobs with counts.
+ */
+      activeCount: sql<number>`
+  COUNT(${applicationsTable.id}) FILTER (
+    WHERE ${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT')
+  )
+`,
+      waitlistCount: sql<number>`
+  COUNT(${applicationsTable.id}) FILTER (
+    WHERE ${applicationsTable.status} = 'WAITLIST'
+  )
+`,
     })
     .from(jobsTable)
     .leftJoin(applicationsTable, eq(applicationsTable.jobId, jobsTable.id))

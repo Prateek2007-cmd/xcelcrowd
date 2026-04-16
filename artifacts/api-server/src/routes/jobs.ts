@@ -21,138 +21,171 @@ import { NotFoundError } from "../lib/errors";
 
 const router: IRouter = Router();
 
+/**
+ * ✅ FIXED: No N+1 queries
+ * Uses LEFT JOIN + GROUP BY for counts
+ */
 router.get("/jobs", async (_req, res): Promise<void> => {
-  const jobs = await db.select().from(jobsTable).orderBy(jobsTable.createdAt);
+  const jobs = await db
+    .select({
+      id: jobsTable.id,
+      title: jobsTable.title,
+      description: jobsTable.description,
+      capacity: jobsTable.capacity,
+      createdAt: jobsTable.createdAt,
 
-  const result = await Promise.all(
-    jobs.map(async (job) => {
-      const [counts] = await db
-        .select({
-          activeCount: sql<number>`COUNT(*) FILTER (WHERE ${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT'))`,
-          waitlistCount: sql<number>`COUNT(*) FILTER (WHERE ${applicationsTable.status} = 'WAITLIST')`,
-        })
-        .from(applicationsTable)
-        .where(eq(applicationsTable.jobId, job.id));
+      activeCount: sql<number>`
+        COUNT(${applicationsTable.id}) FILTER (
+          WHERE ${applicationsTable.status} IN ('ACTIVE', 'PENDING_ACKNOWLEDGMENT')
+        )
+      `,
 
-      return ListJobsResponseItem.parse({
-        id: job.id,
-        title: job.title,
-        description: job.description ?? null,
-        capacity: job.capacity,
-        activeCount: Number(counts?.activeCount ?? 0),
-        waitlistCount: Number(counts?.waitlistCount ?? 0),
-        createdAt: job.createdAt.toISOString(),
-      });
+      waitlistCount: sql<number>`
+        COUNT(${applicationsTable.id}) FILTER (
+          WHERE ${applicationsTable.status} = 'WAITLIST'
+        )
+      `,
+    })
+    .from(jobsTable)
+    .leftJoin(applicationsTable, eq(applicationsTable.jobId, jobsTable.id))
+    .groupBy(jobsTable.id)
+    .orderBy(jobsTable.createdAt);
+
+  const result = jobs.map((job) =>
+    ListJobsResponseItem.parse({
+      id: job.id,
+      title: job.title,
+      description: job.description ?? null,
+      capacity: job.capacity,
+      activeCount: Number(job.activeCount ?? 0),
+      waitlistCount: Number(job.waitlistCount ?? 0),
+      createdAt: job.createdAt.toISOString(),
     })
   );
 
   res.json(result);
 });
 
-router.post("/jobs", validateBody(CreateJobBody), async (req, res, next): Promise<void> => {
-  try {
-    const [job] = await db
-      .insert(jobsTable)
-      .values({
-        title: req.body.title,
-        description: req.body.description ?? null,
-        capacity: req.body.capacity,
-      })
-      .returning();
+router.post(
+  "/jobs",
+  validateBody(CreateJobBody),
+  async (req, res, next): Promise<void> => {
+    try {
+      const [job] = await db
+        .insert(jobsTable)
+        .values({
+          title: req.body.title,
+          description: req.body.description ?? null,
+          capacity: req.body.capacity,
+        })
+        .returning();
 
-    res.status(201).json(
-      ListJobsResponseItem.parse({
+      res.status(201).json(
+        ListJobsResponseItem.parse({
+          id: job.id,
+          title: job.title,
+          description: job.description ?? null,
+          capacity: job.capacity,
+          activeCount: 0,
+          waitlistCount: 0,
+          createdAt: job.createdAt.toISOString(),
+        })
+      );
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.get(
+  "/jobs/:jobId",
+  validateParams(GetJobParams),
+  async (_req, res, next): Promise<void> => {
+    try {
+      const { jobId } = res.locals.params;
+
+      const [job] = await db
+        .select()
+        .from(jobsTable)
+        .where(eq(jobsTable.id, jobId));
+
+      if (!job) {
+        throw new NotFoundError("Job", jobId);
+      }
+
+      const applications = await db
+        .select({
+          applicationId: applicationsTable.id,
+          applicantId: applicationsTable.applicantId,
+          applicantName: applicantsTable.name,
+          applicantEmail: applicantsTable.email,
+          status: applicationsTable.status,
+          appliedAt: applicationsTable.createdAt,
+          promotedAt: applicationsTable.promotedAt,
+          acknowledgeDeadline: applicationsTable.acknowledgeDeadline,
+          position: queuePositionsTable.position,
+        })
+        .from(applicationsTable)
+        .innerJoin(
+          applicantsTable,
+          eq(applicationsTable.applicantId, applicantsTable.id)
+        )
+        .leftJoin(
+          queuePositionsTable,
+          and(
+            eq(queuePositionsTable.applicationId, applicationsTable.id),
+            eq(queuePositionsTable.jobId, job.id)
+          )
+        )
+        .where(eq(applicationsTable.jobId, job.id));
+
+      const active = applications
+        .filter(
+          (a) =>
+            a.status === "ACTIVE" ||
+            a.status === "PENDING_ACKNOWLEDGMENT"
+        )
+        .map((a) => ({
+          applicationId: a.applicationId,
+          applicantId: a.applicantId,
+          applicantName: a.applicantName,
+          applicantEmail: a.applicantEmail,
+          status: a.status,
+          queuePosition: null,
+          appliedAt: a.appliedAt.toISOString(),
+          promotedAt: a.promotedAt?.toISOString() ?? null,
+          acknowledgeDeadline:
+            a.acknowledgeDeadline?.toISOString() ?? null,
+        }));
+
+      const waitlist = applications
+        .filter((a) => a.status === "WAITLIST")
+        .sort((a, b) => (a.position ?? 9999) - (b.position ?? 9999))
+        .map((a) => ({
+          applicationId: a.applicationId,
+          applicantId: a.applicantId,
+          applicantName: a.applicantName,
+          applicantEmail: a.applicantEmail,
+          status: a.status,
+          queuePosition: a.position ?? null,
+          appliedAt: a.appliedAt.toISOString(),
+          promotedAt: a.promotedAt?.toISOString() ?? null,
+          acknowledgeDeadline: null,
+        }));
+
+      res.json({
         id: job.id,
         title: job.title,
         description: job.description ?? null,
         capacity: job.capacity,
-        activeCount: 0,
-        waitlistCount: 0,
+        activeApplicants: active,
+        waitlistApplicants: waitlist,
         createdAt: job.createdAt.toISOString(),
-      })
-    );
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.get("/jobs/:jobId", validateParams(GetJobParams), async (_req, res, next): Promise<void> => {
-  try {
-    const { jobId } = res.locals.params;
-
-    const [job] = await db
-      .select()
-      .from(jobsTable)
-      .where(eq(jobsTable.id, jobId));
-
-    if (!job) {
-      throw new NotFoundError("Job", jobId);
+      });
+    } catch (err) {
+      next(err);
     }
-
-    const applications = await db
-      .select({
-        applicationId: applicationsTable.id,
-        applicantId: applicationsTable.applicantId,
-        applicantName: applicantsTable.name,
-        applicantEmail: applicantsTable.email,
-        status: applicationsTable.status,
-        appliedAt: applicationsTable.createdAt,
-        promotedAt: applicationsTable.promotedAt,
-        acknowledgeDeadline: applicationsTable.acknowledgeDeadline,
-        position: queuePositionsTable.position,
-      })
-      .from(applicationsTable)
-      .innerJoin(applicantsTable, eq(applicationsTable.applicantId, applicantsTable.id))
-      .leftJoin(
-        queuePositionsTable,
-        and(
-          eq(queuePositionsTable.applicationId, applicationsTable.id),
-          eq(queuePositionsTable.jobId, job.id)
-        )
-      )
-      .where(eq(applicationsTable.jobId, job.id));
-
-    const active = applications
-      .filter((a) => a.status === "ACTIVE" || a.status === "PENDING_ACKNOWLEDGMENT")
-      .map((a) => ({
-        applicationId: a.applicationId,
-        applicantId: a.applicantId,
-        applicantName: a.applicantName,
-        applicantEmail: a.applicantEmail,
-        status: a.status,
-        queuePosition: null,
-        appliedAt: a.appliedAt.toISOString(),
-        promotedAt: a.promotedAt?.toISOString() ?? null,
-        acknowledgeDeadline: a.acknowledgeDeadline?.toISOString() ?? null,
-      }));
-
-    const waitlist = applications
-      .filter((a) => a.status === "WAITLIST")
-      .sort((a, b) => (a.position ?? 9999) - (b.position ?? 9999))
-      .map((a) => ({
-        applicationId: a.applicationId,
-        applicantId: a.applicantId,
-        applicantName: a.applicantName,
-        applicantEmail: a.applicantEmail,
-        status: a.status,
-        queuePosition: a.position ?? null,
-        appliedAt: a.appliedAt.toISOString(),
-        promotedAt: a.promotedAt?.toISOString() ?? null,
-        acknowledgeDeadline: null,
-      }));
-
-    res.json({
-      id: job.id,
-      title: job.title,
-      description: job.description ?? null,
-      capacity: job.capacity,
-      activeApplicants: active,
-      waitlistApplicants: waitlist,
-      createdAt: job.createdAt.toISOString(),
-    });
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 export default router;

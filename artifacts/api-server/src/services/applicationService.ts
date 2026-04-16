@@ -320,4 +320,34 @@ export async function acknowledgePromotion(applicationId: number): Promise<Ackno
     message: "Promotion acknowledged. You are now ACTIVE.",
   };
 }
+/**
+ * Public apply flow:
+ * - Find or create applicant
+ * - Apply to job
+ */
+export async function applyPublic(
+  name: string,
+  email: string,
+  jobId: number
+) {
+  // reuse existing service
+  const [existing] = await db
+    .select()
+    .from(applicantsTable)
+    .where(eq(applicantsTable.email, email));
 
+  let applicantId: number;
+
+  if (existing) {
+    applicantId = existing.id;
+  } else {
+    const [created] = await db
+      .insert(applicantsTable)
+      .values({ name, email })
+      .returning();
+
+    applicantId = created.id;
+  }
+
+  return applyToJob(applicantId, jobId);
+}

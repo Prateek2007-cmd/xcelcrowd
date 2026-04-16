@@ -3,9 +3,7 @@
  * No direct DB access. Errors bubble up to the global error handler.
  */
 import { Router, type IRouter } from "express";
-import { eq } from "drizzle-orm";
-import { db } from "@workspace/db";
-import { applicantsTable } from "@workspace/db";
+
 import {
   ApplyToJobBody,
   WithdrawApplicationBody,
@@ -48,34 +46,23 @@ router.post("/acknowledge", validateBody(AcknowledgePromotionBody), async (req, 
   }
 });
 
-router.post("/apply-public", validateBody(PublicApplyBody), async (req, res, next): Promise<void> => {
-  try {
-    const { name, email, jobId } = req.body;
+import { applyPublic } from "../services/applicationService";
 
-    // Find or create applicant
-    let applicantId: number;
-    const [existing] = await db
-      .select()
-      .from(applicantsTable)
-      .where(eq(applicantsTable.email, email));
+router.post(
+  "/apply-public",
+  validateBody(PublicApplyBody),
+  async (req, res, next): Promise<void> => {
+    try {
+      const { name, email, jobId } = req.body;
 
-    if (existing) {
-      applicantId = existing.id;
-    } else {
-      const [created] = await db
-        .insert(applicantsTable)
-        .values({ name, email })
-        .returning();
-      applicantId = created.id;
+      const result = await applyPublic(name, email, jobId);
+
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
     }
-
-    // Apply to job (reuses existing service with all business logic)
-    const result = await applyToJob(applicantId, jobId);
-    res.status(201).json({ ...result, applicantId });
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 export default router;
 
