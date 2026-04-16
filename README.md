@@ -408,6 +408,101 @@ For a multi-instance or high-throughput deployment:
 - **Distributed worker** — Replace `setInterval` with BullMQ or pg-boss to safely run the decay worker across multiple API server instances.
 
 ---
+## 🔧 Dependency & Infrastructure Decisions
+
+### Dependency Management
+
+This project uses **pnpm** as the package manager for its monorepo setup.
+
+Reasons:
+- Efficient disk usage via content-addressable storage
+- Fast installs across multiple workspaces (`artifacts/`, `lib/`)
+- Deterministic builds using `pnpm-lock.yaml`
+
+The lockfile is committed to ensure:
+- Consistent dependency resolution across environments
+- Reproducible builds in CI and local development
+
+---
+
+### Database Choice
+
+**PostgreSQL** was chosen over alternatives (e.g., MySQL, MongoDB) because:
+
+- Supports advanced row-level locking (`FOR UPDATE`, `SKIP LOCKED`)
+- Strong transactional guarantees (ACID)
+- Required for safe concurrent queue operations
+
+These features are critical for enforcing capacity limits without race conditions.
+
+---
+
+### ORM Choice
+
+**Drizzle ORM** was selected instead of Prisma/TypeORM because:
+
+- Allows direct SQL control when needed (important for locking queries)
+- Fully type-safe without heavy abstraction overhead
+- Better suited for performance-critical query paths like queue operations
+
+---
+
+### API Layer
+
+**Express 5** is used as the backend framework:
+
+- Minimal and flexible (no over-opinionated structure)
+- Easy integration with custom middleware (Zod validation, error handling)
+- Keeps routing layer thin while delegating logic to services
+
+---
+
+### Background Worker Design
+
+A **polling-based worker (`setInterval`)** is used instead of event-driven systems.
+
+Reasoning:
+- No external dependencies (e.g., Redis, BullMQ)
+- Logic remains fully testable within application code
+- Sufficient for a system where timing precision is not critical (5-minute windows)
+
+Tradeoff:
+- Not ideal for horizontally scaled environments
+- Would be replaced with distributed job queues in production
+
+---
+
+### Concurrency Strategy
+
+Instead of optimistic locking or retries, the system uses:
+
+- `FOR UPDATE` → ensures safe capacity checks
+- `FOR UPDATE SKIP LOCKED` → prevents duplicate queue promotions
+
+This approach:
+- Guarantees correctness without retry loops
+- Keeps logic simple and deterministic
+- Matches real-world transactional queue systems
+
+---
+
+### Environment Configuration
+
+- `.env` is used for runtime configuration (DB connection, ports)
+- `.replit` is included for cloud/dev environment bootstrapping
+- Configuration is intentionally minimal to keep setup friction low
+
+---
+
+### Tradeoff Philosophy
+
+Across the system, decisions favor:
+
+- **Correctness over complexity**
+- **Explicit control over abstraction**
+- **Simplicity over premature scalability**
+
+This ensures the system is easy to reason about while still being production-capable.
 
 ## Setup Instructions
 
