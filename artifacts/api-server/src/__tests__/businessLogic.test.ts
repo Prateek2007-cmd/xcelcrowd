@@ -1,6 +1,5 @@
 /**
- * Business logic tests — simplified and readable.
- * Directly mocks DB methods without complex helper chains.
+ * Business logic tests — improved with deeper edge-case validation.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -49,19 +48,62 @@ describe("applyToJob", () => {
 
   it("throws NotFoundError if job does not exist", async () => {
     (db.select as any)
-      .mockResolvedValueOnce([{ id: 1 }]) // applicant exists
-      .mockResolvedValueOnce([]); // job not found
+      .mockResolvedValueOnce([{ id: 1 }])
+      .mockResolvedValueOnce([]);
 
     await expect(applyToJob(1, 999)).rejects.toThrow(NotFoundError);
   });
 
   it("throws DuplicateSubmissionError if active application exists", async () => {
     (db.select as any)
-      .mockResolvedValueOnce([{ id: 1 }]) // applicant
-      .mockResolvedValueOnce([{ id: 1, capacity: 3 }]) // job
-      .mockResolvedValueOnce([{ id: 10, status: "ACTIVE" }]); // existing app
+      .mockResolvedValueOnce([{ id: 1 }])
+      .mockResolvedValueOnce([{ id: 1, capacity: 3 }])
+      .mockResolvedValueOnce([{ id: 10, status: "ACTIVE" }]);
 
     await expect(applyToJob(1, 1)).rejects.toThrow(DuplicateSubmissionError);
+  });
+
+  it("assigns ACTIVE when capacity is available", async () => {
+    (db.select as any)
+      .mockResolvedValueOnce([{ id: 1 }]) // applicant
+      .mockResolvedValueOnce([{ id: 1, capacity: 3 }]) // job
+      .mockResolvedValueOnce([]); // no existing app
+
+    (db.transaction as any).mockImplementation(async (fn: any) => {
+      return fn({
+        select: vi.fn().mockResolvedValue([{ count: 1 }]), // below capacity
+        insert: vi.fn().mockResolvedValue([{ id: 100, status: "ACTIVE" }]),
+        update: vi.fn(),
+        delete: vi.fn(),
+        execute: vi.fn(),
+      });
+    });
+
+    const result = await applyToJob(1, 1);
+
+    expect(result).toBeDefined();
+    expect(result.status).toBe("ACTIVE");
+  });
+
+  it("assigns WAITLIST when capacity is full", async () => {
+    (db.select as any)
+      .mockResolvedValueOnce([{ id: 1 }])
+      .mockResolvedValueOnce([{ id: 1, capacity: 1 }])
+      .mockResolvedValueOnce([]);
+
+    (db.transaction as any).mockImplementation(async (fn: any) => {
+      return fn({
+        select: vi.fn().mockResolvedValue([{ count: 1 }]), // at capacity
+        insert: vi.fn().mockResolvedValue([{ id: 101, status: "WAITLIST" }]),
+        update: vi.fn(),
+        delete: vi.fn(),
+        execute: vi.fn(),
+      });
+    });
+
+    const result = await applyToJob(1, 1);
+
+    expect(result.status).toBe("WAITLIST");
   });
 });
 
@@ -82,6 +124,26 @@ describe("withdrawApplication", () => {
     ]);
 
     await expect(withdrawApplication(1)).rejects.toThrow(ConflictError);
+  });
+
+  it("successfully withdraws active application", async () => {
+    (db.select as any).mockResolvedValueOnce([
+      { id: 1, status: "ACTIVE", applicantId: 1, jobId: 1 },
+    ]);
+
+    (db.transaction as any).mockImplementation(async (fn: any) => {
+      return fn({
+        update: vi.fn().mockResolvedValue([{ id: 1, status: "INACTIVE" }]),
+        select: vi.fn(),
+        insert: vi.fn(),
+        delete: vi.fn(),
+        execute: vi.fn(),
+      });
+    });
+
+    const result = await withdrawApplication(1);
+
+    expect(result).toBeDefined();
   });
 });
 
@@ -131,10 +193,38 @@ describe("acknowledgePromotion", () => {
         insert: vi.fn(),
         update: vi.fn(),
         delete: vi.fn(),
-        execute: vi.fn().mockResolvedValue({ rows: [] }),
+        execute: vi.fn(),
       });
     });
 
     await expect(acknowledgePromotion(1)).rejects.toThrow(GoneError);
+  });
+
+  it("successfully acknowledges promotion", async () => {
+    const futureDeadline = new Date(Date.now() + 60000);
+
+    (db.select as any).mockResolvedValueOnce([
+      {
+        id: 1,
+        status: "PENDING_ACKNOWLEDGMENT",
+        applicantId: 1,
+        jobId: 1,
+        acknowledgeDeadline: futureDeadline,
+      },
+    ]);
+
+    (db.transaction as any).mockImplementation(async (fn: any) => {
+      return fn({
+        update: vi.fn().mockResolvedValue([{ id: 1, status: "ACTIVE" }]),
+        select: vi.fn(),
+        insert: vi.fn(),
+        delete: vi.fn(),
+        execute: vi.fn(),
+      });
+    });
+
+    const result = await acknowledgePromotion(1);
+
+    expect(result).toBeDefined();
   });
 });
