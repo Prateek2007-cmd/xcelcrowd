@@ -1,12 +1,14 @@
 /**
  * Centralized database error classification utilities.
  *
- * Single source of truth for mapping raw database errors (especially
- * PostgreSQL constraint violations) into structured AppError subclasses.
+ * Uses the semantic DbErrorMapper layer internally — no raw PG codes
+ * in the classification logic. The mapper is the single source of truth
+ * for PG code → semantic type translation.
  *
  * Used by:
- *   - applicationService.ts  (catch blocks around DB operations)
- *   - errorHandler.ts        (global Express error middleware)
+ *   - applicationService (catch blocks around DB operations)
+ *   - errorHandler.ts    (global Express error middleware)
+ *   - pipeline/decay.ts  (structured decay error handling)
  */
 import {
   AppError,
@@ -14,26 +16,14 @@ import {
   ValidationError,
   DatabaseError,
 } from "./errors";
+import {
+  mapDbError,
+  extractPgCode,
+  DbErrorType,
+} from "./dbErrorMapper";
 
-// ── PostgreSQL error code extraction ─────────────────────────────────────────
-
-/**
- * Extract PostgreSQL error code from various error structures.
- *
- * PostgreSQL errors can appear in multiple shapes depending on the driver
- * and whether the error bubbled through a transaction wrapper:
- *   - `err.code`        (node-pg direct)
- *   - `err.cause.code`  (Drizzle wraps the original PG error as `cause`)
- */
-export function getPgErrorCode(err: unknown): string | undefined {
-  if (!err || typeof err !== "object") return undefined;
-
-  const errObj = err as Record<string, unknown>;
-  return (
-    (errObj.code as string) ||
-    (errObj.cause as Record<string, unknown>)?.code as string
-  );
-}
+// Re-export for consumers that still import from errorUtils
+export { extractPgCode as getPgErrorCode } from "./dbErrorMapper";
 
 // ── Error formatting ─────────────────────────────────────────────────────────
 
@@ -57,48 +47,51 @@ export function formatErrorMessage(err: unknown): string {
 /**
  * Classify a raw database error into the appropriate AppError subclass.
  *
- * Handles all known PostgreSQL constraint violation codes:
- *   - 23505  unique_violation  → ConflictError  (409)
- *   - 23503  foreign_key       → ValidationError (400)
- *   - 23502  not_null          → ValidationError (400)
- *   - 23514  check_violation   → ValidationError (400)
+ * Uses the semantic DbErrorMapper — no raw PG code string comparisons here.
  *
- * Returns `null` if the error doesn't match any known PG code,
+ * Returns `null` if the error doesn't match any known DB error type,
  * so callers can decide whether to fall through to a generic handler.
  */
 export function classifyDbError(err: unknown): AppError | null {
-  if (!err || typeof err !== "object") return null;
+  const dbErr = mapDbError(err);
+  if (!dbErr) return null;
 
-  const pgCode = getPgErrorCode(err);
-  const detail = (err as Record<string, unknown>).detail as string | undefined;
+  const detail = dbErr.detail;
 
-  switch (pgCode) {
-    case "23505":
+  switch (dbErr.type) {
+    case DbErrorType.UNIQUE_VIOLATION:
       return new ConflictError(
-        detail
-          ? `Duplicate entry: ${detail}`
-          : "A record with this value already exists"
+        detail ? `Duplicate entry: ${detail}` : "A record with this value already exists"
       );
 
-    case "23503":
+    case DbErrorType.FOREIGN_KEY_VIOLATION:
       return new ValidationError(
-        detail
-          ? `Referenced record not found: ${detail}`
-          : "Referenced record does not exist"
+        detail ? `Referenced record not found: ${detail}` : "Referenced record does not exist"
       );
 
-    case "23502":
+    case DbErrorType.NOT_NULL_VIOLATION:
       return new ValidationError(
-        detail
-          ? `Missing required field: ${detail}`
-          : "A required field is missing"
+        detail ? `Missing required field: ${detail}` : "A required field is missing"
       );
 
-    case "23514":
+    case DbErrorType.CHECK_VIOLATION:
       return new ValidationError(
-        detail
-          ? `Constraint violation: ${detail}`
-          : "A value constraint was violated"
+        detail ? `Constraint violation: ${detail}` : "A value constraint was violated"
+      );
+
+    case DbErrorType.SERIALIZATION_FAILURE:
+      return new DatabaseError(
+        "Transaction serialization failure — please retry"
+      );
+
+    case DbErrorType.CONNECTION_ERROR:
+      return new DatabaseError(
+        "Database connection error — please try again later"
+      );
+
+    case DbErrorType.UNKNOWN:
+      return new DatabaseError(
+        detail ? `Database error: ${detail}` : "An unexpected database error occurred"
       );
 
     default:
@@ -108,16 +101,11 @@ export function classifyDbError(err: unknown): AppError | null {
 
 /**
  * Classify a raw error into an AppError, with a guaranteed non-null fallback.
- *
- * Convenience wrapper: tries classifyDbError first, then wraps anything
- * unrecognized in a generic DatabaseError. Useful in catch blocks where
- * you always want to throw an AppError.
  */
 export function classifyDbErrorOrDefault(
   err: unknown,
   fallbackMessage = "Database operation failed"
 ): AppError {
-  // If it's already an AppError, pass through
   if (err instanceof AppError) return err;
 
   const classified = classifyDbError(err);

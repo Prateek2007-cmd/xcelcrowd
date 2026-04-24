@@ -17,11 +17,11 @@ import {
   DatabaseError,
 } from "../../lib/errors";
 import {
-  getPgErrorCode,
   isError,
   formatErrorMessage,
   classifyDbErrorOrDefault,
 } from "../../lib/errorUtils";
+import { mapDbError, DbErrorType } from "../../lib/dbErrorMapper";
 import {
   getActiveCount,
   checkAndDecayExpiredAcknowledgments,
@@ -171,10 +171,10 @@ export async function applyPublic(
   } catch (err: unknown) {
     if (err instanceof DatabaseError) throw err;
 
-    const pgErrorCode = getPgErrorCode(err);
+    const dbErr = mapDbError(err);
     const errorMessage = formatErrorMessage(err);
 
-    if (pgErrorCode === "23505") {
+    if (dbErr?.type === DbErrorType.UNIQUE_VIOLATION) {
       try {
         const existing = await db
           .select()
@@ -184,7 +184,7 @@ export async function applyPublic(
 
         if (!existing || existing.length === 0) {
           logger.error(
-            { errorCode: pgErrorCode, email, errorType: "CONSTRAINT_MISMATCH" },
+            { errorType: dbErr.type, email, rawCode: dbErr.rawCode },
             "Duplicate email constraint failed: applicant not found after detecting constraint"
           );
           throw new DatabaseError(
@@ -206,10 +206,11 @@ export async function applyPublic(
     } else {
       logger.error(
         {
-          errorCode: pgErrorCode || "unknown",
+          errorType: dbErr?.type || "unknown",
+          rawCode: dbErr?.rawCode,
           errorMessage,
           email,
-          errorType: isError(err) ? err.constructor.name : typeof err,
+          errorClass: isError(err) ? err.constructor.name : typeof err,
         },
         "Unknown database error during applicant creation or resolution"
       );

@@ -6,7 +6,7 @@ import { applicationsTable, queuePositionsTable, auditLogsTable } from "@workspa
 import { eq, and, sql } from "drizzle-orm";
 import { logger } from "../../lib/logger";
 import { AppError } from "../../lib/errors";
-import { getPgErrorCode } from "../../lib/errorUtils";
+import { mapDbError } from "../../lib/dbErrorMapper";
 import type { TxHandle, DecayResult } from "./types";
 import { promoteUntilFull } from "./promote";
 
@@ -139,15 +139,16 @@ export async function runDecayForJob(
       };
     }
 
-    const pgCode = getPgErrorCode(err);
-    if (pgCode) {
+    // ── 2. Database errors (semantic mapping) ──
+    const dbErr = mapDbError(err);
+    if (dbErr) {
       logger.error(
-        { jobId, pgCode, stage: "decay", err },
-        `Database error (PG ${pgCode}) during decay cycle for job ${jobId}`
+        { jobId, errorType: dbErr.type, rawCode: dbErr.rawCode, stage: "decay", err },
+        `Database error (${dbErr.type}) during decay cycle for job ${jobId}`
       );
       return {
         decayed: 0, promoted: 0, success: false,
-        error: { code: `PG_${pgCode}`, message: `Database constraint error: ${pgCode}`, stage: "decay" },
+        error: { code: dbErr.type, message: `Database error: ${dbErr.type}`, stage: "decay" },
       };
     }
 

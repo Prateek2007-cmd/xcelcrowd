@@ -1,17 +1,19 @@
 /**
  * API-level integration tests — full HTTP request → Express → service → DB → response.
  *
- * Uses:
- *   - supertest to fire real HTTP requests against the Express app
- *   - real PostgreSQL database (no mocks)
- *   - cleanAllTables() for test isolation
+ * HIGH ASSERTION DENSITY: Every test validates:
+ *   1. HTTP status code
+ *   2. Response body structure and values
+ *   3. Database state after the operation
+ *   4. Side effects (queue positions, audit logs, status transitions)
  *
+ * Uses real PostgreSQL database (no mocks).
  * Run with: pnpm test:api
  */
 import { describe, it, expect, beforeEach, afterAll } from "vitest";
 import request from "supertest";
 import app from "../app";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import {
   getTestDb,
   closeTestDb,
@@ -23,6 +25,7 @@ import {
   applicationsTable,
   applicantsTable,
   queuePositionsTable,
+  auditLogsTable,
 } from "./setupTestDb";
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -41,7 +44,7 @@ afterAll(async () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("POST /api/apply-public", () => {
-  it("creates applicant and application, returns 201", async () => {
+  it("creates applicant + application + audit log, returns correct body", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 5 });
 
@@ -50,28 +53,54 @@ describe("POST /api/apply-public", () => {
       .send({ name: "Prateek", email: "prateek@test.com", jobId: job.id })
       .expect(201);
 
-    expect(res.body).toHaveProperty("applicationId");
-    expect(res.body).toHaveProperty("applicantId");
+    // ── Response body assertions ──
+    expect(res.body.applicationId).toBeGreaterThan(0);
+    expect(res.body.applicantId).toBeGreaterThan(0);
     expect(res.body.jobId).toBe(job.id);
-    expect(res.body.status).toBeDefined();
+    expect(res.body.status).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(res.body.queuePosition).toBeNull();
+    expect(res.body.message).toContain("promoted");
 
-    // Verify applicant was inserted in DB
+    // ── DB: applicant created ──
     const [applicant] = await db
       .select()
       .from(applicantsTable)
       .where(eq(applicantsTable.email, "prateek@test.com"));
     expect(applicant).toBeDefined();
     expect(applicant.name).toBe("Prateek");
+    expect(applicant.id).toBe(res.body.applicantId);
 
-    // Verify application was created
+    // ── DB: application created with correct fields ──
     const [application] = await db
       .select()
       .from(applicationsTable)
       .where(eq(applicationsTable.id, res.body.applicationId));
     expect(application).toBeDefined();
+    expect(application.status).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(application.jobId).toBe(job.id);
+    expect(application.applicantId).toBe(res.body.applicantId);
+    expect(application.promotedAt).not.toBeNull();
+    expect(application.acknowledgeDeadline).not.toBeNull();
+    // Deadline should be ~10 minutes in the future
+    expect(application.acknowledgeDeadline!.getTime()).toBeGreaterThan(Date.now());
+
+    // ── DB: audit logs written (APPLIED + PROMOTED) ──
+    const logs = await db
+      .select()
+      .from(auditLogsTable)
+      .where(eq(auditLogsTable.applicationId, res.body.applicationId));
+    expect(logs.length).toBe(2);
+    expect(logs.map((l) => l.eventType).sort()).toEqual(["APPLIED", "PROMOTED"]);
+
+    // ── No queue position (capacity available) ──
+    const queueEntries = await db
+      .select()
+      .from(queuePositionsTable)
+      .where(eq(queuePositionsTable.applicationId, res.body.applicationId));
+    expect(queueEntries.length).toBe(0);
   });
 
-  it("reuses existing applicant on duplicate email (no duplicate rows)", async () => {
+  it("reuses existing applicant on duplicate email — single applicant row, new application", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 5 });
 
@@ -81,7 +110,7 @@ describe("POST /api/apply-public", () => {
       .send({ name: "Prateek", email: "dup@test.com", jobId: job.id })
       .expect(201);
 
-    // Withdraw first so we can re-apply
+    // Withdraw so we can re-apply
     await request(app)
       .post("/api/withdraw")
       .send({ applicationId: res1.body.applicationId })
@@ -93,18 +122,29 @@ describe("POST /api/apply-public", () => {
       .send({ name: "Prateek Updated", email: "dup@test.com", jobId: job.id })
       .expect(201);
 
-    // Same applicant ID reused
+    // ── Same applicant reused ──
     expect(res2.body.applicantId).toBe(res1.body.applicantId);
+    // ── Different application ID ──
+    expect(res2.body.applicationId).not.toBe(res1.body.applicationId);
 
-    // Only ONE applicant row exists
+    // ── DB: only ONE applicant row ──
     const applicants = await db
       .select()
       .from(applicantsTable)
       .where(eq(applicantsTable.email, "dup@test.com"));
     expect(applicants.length).toBe(1);
+
+    // ── DB: TWO application rows (one INACTIVE, one new) ──
+    const apps = await db
+      .select()
+      .from(applicationsTable)
+      .where(eq(applicationsTable.applicantId, res1.body.applicantId));
+    expect(apps.length).toBe(2);
+    expect(apps.filter((a) => a.status === "INACTIVE").length).toBe(1);
+    expect(apps.filter((a) => a.status !== "INACTIVE").length).toBe(1);
   });
 
-  it("returns 409 for duplicate active application to same job", async () => {
+  it("returns 409 with structured error for duplicate active application", async () => {
     const job = await seedJob({ capacity: 5 });
 
     await request(app)
@@ -112,20 +152,38 @@ describe("POST /api/apply-public", () => {
       .send({ name: "Alice", email: "alice@test.com", jobId: job.id })
       .expect(201);
 
-    // Second apply to same job → 409
     const res = await request(app)
       .post("/api/apply-public")
       .send({ name: "Alice", email: "alice@test.com", jobId: job.id })
       .expect(409);
 
+    // ── Unified error contract ──
     expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBe("DUPLICATE_SUBMISSION");
+    expect(res.body.error.message).toContain("already has an active application");
+    expect(res.body.error.details).toBeNull();
   });
 
-  it("returns 404 when job does not exist", async () => {
-    await request(app)
+  it("returns 404 with structured error when job does not exist", async () => {
+    const res = await request(app)
       .post("/api/apply-public")
       .send({ name: "Bob", email: "bob@test.com", jobId: 99999 })
       .expect(404);
+
+    expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBe("NOT_FOUND");
+    expect(res.body.error.message).toContain("99999");
+  });
+
+  it("returns 400 with structured error when body fields are missing", async () => {
+    const res = await request(app)
+      .post("/api/apply-public")
+      .send({})
+      .expect(400);
+
+    expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBeDefined();
+    expect(typeof res.body.error.message).toBe("string");
   });
 });
 
@@ -134,7 +192,7 @@ describe("POST /api/apply-public", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("Capacity management — PENDING vs WAITLIST", () => {
-  it("first applicant gets PENDING_ACKNOWLEDGMENT, second goes to WAITLIST when capacity=1", async () => {
+  it("first applicant gets PENDING, second gets WAITLIST with correct queue position", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 1 });
 
@@ -143,22 +201,40 @@ describe("Capacity management — PENDING vs WAITLIST", () => {
       .send({ name: "First", email: "first@test.com", jobId: job.id })
       .expect(201);
 
+    // ── First: PENDING_ACKNOWLEDGMENT ──
     expect(res1.body.status).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(res1.body.queuePosition).toBeNull();
 
     const res2 = await request(app)
       .post("/api/apply-public")
       .send({ name: "Second", email: "second@test.com", jobId: job.id })
       .expect(201);
 
+    // ── Second: WAITLIST with position ──
     expect(res2.body.status).toBe("WAITLIST");
     expect(res2.body.queuePosition).toBeGreaterThanOrEqual(1);
+    expect(res2.body.message).toContain("waitlist");
 
-    // Verify queue position in DB
+    // ── DB: queue position exists and matches response ──
     const [qp] = await db
       .select()
       .from(queuePositionsTable)
       .where(eq(queuePositionsTable.applicationId, res2.body.applicationId));
     expect(qp).toBeDefined();
+    expect(qp.position).toBe(res2.body.queuePosition);
+
+    // ── DB: first has no queue entry ──
+    const firstQp = await db
+      .select()
+      .from(queuePositionsTable)
+      .where(eq(queuePositionsTable.applicationId, res1.body.applicationId));
+    expect(firstQp.length).toBe(0);
+
+    // ── DB: statuses match response ──
+    const [app1] = await db.select().from(applicationsTable).where(eq(applicationsTable.id, res1.body.applicationId));
+    const [app2] = await db.select().from(applicationsTable).where(eq(applicationsTable.id, res2.body.applicationId));
+    expect(app1.status).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(app2.status).toBe("WAITLIST");
   });
 });
 
@@ -167,11 +243,10 @@ describe("Capacity management — PENDING vs WAITLIST", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("POST /api/acknowledge", () => {
-  it("transitions PENDING_ACKNOWLEDGMENT → ACTIVE on valid acknowledgment", async () => {
+  it("transitions PENDING → ACTIVE: response, DB state, audit log all verified", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 5 });
 
-    // Apply (gets PENDING_ACKNOWLEDGMENT)
     const applyRes = await request(app)
       .post("/api/apply-public")
       .send({ name: "Charlie", email: "charlie@test.com", jobId: job.id })
@@ -179,34 +254,50 @@ describe("POST /api/acknowledge", () => {
 
     expect(applyRes.body.status).toBe("PENDING_ACKNOWLEDGMENT");
 
-    // Acknowledge
     const ackRes = await request(app)
       .post("/api/acknowledge")
       .send({ applicationId: applyRes.body.applicationId })
       .expect(200);
 
+    // ── Response ──
     expect(ackRes.body.status).toBe("ACTIVE");
     expect(ackRes.body.applicationId).toBe(applyRes.body.applicationId);
+    expect(ackRes.body.applicantId).toBe(applyRes.body.applicantId);
+    expect(ackRes.body.message).toContain("ACTIVE");
 
-    // Verify in DB
-    const [app_row] = await db
+    // ── DB: application state ──
+    const [appRow] = await db
       .select()
       .from(applicationsTable)
       .where(eq(applicationsTable.id, applyRes.body.applicationId));
-    expect(app_row.status).toBe("ACTIVE");
-    expect(app_row.acknowledgedAt).not.toBeNull();
+    expect(appRow.status).toBe("ACTIVE");
+    expect(appRow.acknowledgedAt).not.toBeNull();
+    expect(appRow.acknowledgeDeadline).toBeNull(); // cleared after ack
+
+    // ── DB: ACKNOWLEDGED audit log ──
+    const logs = await db
+      .select()
+      .from(auditLogsTable)
+      .where(
+        and(
+          eq(auditLogsTable.applicationId, applyRes.body.applicationId),
+          eq(auditLogsTable.eventType, "ACKNOWLEDGED")
+        )
+      );
+    expect(logs.length).toBe(1);
+    expect(logs[0].fromStatus).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(logs[0].toStatus).toBe("ACTIVE");
   });
 
-  it("returns 410 (Gone) for expired acknowledgment deadline", async () => {
+  it("returns 410 for expired deadline — decays, requeues, penalizes", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 5 });
     const applicant = await seedApplicant({ email: "expired-ack@test.com" });
 
-    // Seed application with already-expired deadline
     const expiredApp = await seedPendingApplication(
       applicant.id,
       job.id,
-      new Date(Date.now() - 60_000) // expired 1 min ago
+      new Date(Date.now() - 60_000)
     );
 
     const res = await request(app)
@@ -214,26 +305,56 @@ describe("POST /api/acknowledge", () => {
       .send({ applicationId: expiredApp.id })
       .expect(410);
 
+    // ── Response: unified error contract ──
     expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBe("GONE");
+    expect(res.body.error.message).toContain("expired");
 
-    // Verify status changed to WAITLIST in DB
-    const [app_row] = await db
+    // ── DB: moved to WAITLIST with penalty ──
+    const [appRow] = await db
       .select()
       .from(applicationsTable)
       .where(eq(applicationsTable.id, expiredApp.id));
-    expect(app_row.status).toBe("WAITLIST");
-    expect(app_row.penaltyCount).toBe(1);
+    expect(appRow.status).toBe("WAITLIST");
+    expect(appRow.penaltyCount).toBe(1);
+    expect(appRow.promotedAt).toBeNull();
+    expect(appRow.acknowledgeDeadline).toBeNull();
+
+    // ── DB: queue position reassigned ──
+    const [qp] = await db
+      .select()
+      .from(queuePositionsTable)
+      .where(eq(queuePositionsTable.applicationId, expiredApp.id));
+    expect(qp).toBeDefined();
+    expect(qp.position).toBeGreaterThanOrEqual(1);
+
+    // ── DB: DECAY_TRIGGERED audit log ──
+    const decayLogs = await db
+      .select()
+      .from(auditLogsTable)
+      .where(
+        and(
+          eq(auditLogsTable.applicationId, expiredApp.id),
+          eq(auditLogsTable.eventType, "DECAY_TRIGGERED")
+        )
+      );
+    expect(decayLogs.length).toBe(1);
+    expect(decayLogs[0].fromStatus).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(decayLogs[0].toStatus).toBe("WAITLIST");
   });
 
-  it("returns 409 when application is not PENDING_ACKNOWLEDGMENT", async () => {
+  it("returns 409 with correct error when application is not PENDING", async () => {
     const job = await seedJob({ capacity: 5 });
     const applicant = await seedApplicant({ email: "active-ack@test.com" });
     const activeApp = await seedActiveApplication(applicant.id, job.id);
 
-    await request(app)
+    const res = await request(app)
       .post("/api/acknowledge")
       .send({ applicationId: activeApp.id })
       .expect(409);
+
+    expect(res.body.error.code).toBe("CONFLICT");
+    expect(res.body.error.message).toContain("not pending");
   });
 });
 
@@ -242,73 +363,122 @@ describe("POST /api/acknowledge", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("POST /api/withdraw", () => {
-  it("sets status to INACTIVE and frees the slot", async () => {
+  it("sets INACTIVE, clears fields, writes audit log, frees slot", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 1 });
 
-    // Apply (fills the slot)
     const applyRes = await request(app)
       .post("/api/apply-public")
       .send({ name: "Diana", email: "diana@test.com", jobId: job.id })
       .expect(201);
 
-    // Withdraw
     const withdrawRes = await request(app)
       .post("/api/withdraw")
       .send({ applicationId: applyRes.body.applicationId })
       .expect(200);
 
+    // ── Response ──
     expect(withdrawRes.body.status).toBe("INACTIVE");
+    expect(withdrawRes.body.applicationId).toBe(applyRes.body.applicationId);
     expect(withdrawRes.body.message).toContain("withdrawn");
 
-    // Verify in DB
-    const [app_row] = await db
+    // ── DB: application state ──
+    const [appRow] = await db
       .select()
       .from(applicationsTable)
       .where(eq(applicationsTable.id, applyRes.body.applicationId));
-    expect(app_row.status).toBe("INACTIVE");
+    expect(appRow.status).toBe("INACTIVE");
+    expect(appRow.withdrawnAt).not.toBeNull();
+    expect(appRow.promotedAt).toBeNull();
+    expect(appRow.acknowledgeDeadline).toBeNull();
+
+    // ── DB: WITHDRAWN audit log ──
+    const logs = await db
+      .select()
+      .from(auditLogsTable)
+      .where(
+        and(
+          eq(auditLogsTable.applicationId, applyRes.body.applicationId),
+          eq(auditLogsTable.eventType, "WITHDRAWN")
+        )
+      );
+    expect(logs.length).toBe(1);
+    expect(logs[0].fromStatus).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(logs[0].toStatus).toBe("INACTIVE");
+
+    // ── DB: no queue entries ──
+    const qp = await db
+      .select()
+      .from(queuePositionsTable)
+      .where(eq(queuePositionsTable.applicationId, applyRes.body.applicationId));
+    expect(qp.length).toBe(0);
   });
 
-  it("promotes next waitlisted candidate after withdrawal", async () => {
+  it("promotes next waitlisted candidate after withdrawal — full cascade verified", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 1 });
 
-    // Fill the slot
     const r1 = await request(app)
       .post("/api/apply-public")
       .send({ name: "Eve", email: "eve@test.com", jobId: job.id })
       .expect(201);
     expect(r1.body.status).toBe("PENDING_ACKNOWLEDGMENT");
 
-    // Second goes to waitlist
     const r2 = await request(app)
       .post("/api/apply-public")
       .send({ name: "Frank", email: "frank@test.com", jobId: job.id })
       .expect(201);
     expect(r2.body.status).toBe("WAITLIST");
 
-    // Eve withdraws → Frank should get promoted
+    // Eve withdraws
     await request(app)
       .post("/api/withdraw")
       .send({ applicationId: r1.body.applicationId })
       .expect(200);
 
-    // Verify Frank is now PENDING_ACKNOWLEDGMENT
+    // ── DB: Frank promoted to PENDING_ACKNOWLEDGMENT ──
     const [frank] = await db
       .select()
       .from(applicationsTable)
       .where(eq(applicationsTable.id, r2.body.applicationId));
     expect(frank.status).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(frank.promotedAt).not.toBeNull();
+    expect(frank.acknowledgeDeadline).not.toBeNull();
+
+    // ── DB: Frank's queue entry removed after promotion ──
+    const frankQp = await db
+      .select()
+      .from(queuePositionsTable)
+      .where(eq(queuePositionsTable.applicationId, r2.body.applicationId));
+    expect(frankQp.length).toBe(0);
+
+    // ── DB: PROMOTED audit log for Frank ──
+    const promoLogs = await db
+      .select()
+      .from(auditLogsTable)
+      .where(
+        and(
+          eq(auditLogsTable.applicationId, r2.body.applicationId),
+          eq(auditLogsTable.eventType, "PROMOTED")
+        )
+      );
+    expect(promoLogs.length).toBe(1);
+    expect(promoLogs[0].fromStatus).toBe("WAITLIST");
+    expect(promoLogs[0].toStatus).toBe("PENDING_ACKNOWLEDGMENT");
   });
 
-  it("returns 404 for non-existent application", async () => {
-    await request(app)
+  it("returns 404 for non-existent application with structured error", async () => {
+    const res = await request(app)
       .post("/api/withdraw")
       .send({ applicationId: 99999 })
       .expect(404);
+
+    expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBe("NOT_FOUND");
+    expect(res.body.error.message).toContain("99999");
   });
 
-  it("returns 409 when application is already INACTIVE", async () => {
+  it("returns 409 when already INACTIVE with structured error", async () => {
     const job = await seedJob({ capacity: 5 });
 
     const applyRes = await request(app)
@@ -316,17 +486,18 @@ describe("POST /api/withdraw", () => {
       .send({ name: "Grace", email: "grace@test.com", jobId: job.id })
       .expect(201);
 
-    // Withdraw once
     await request(app)
       .post("/api/withdraw")
       .send({ applicationId: applyRes.body.applicationId })
       .expect(200);
 
-    // Withdraw again → 409
-    await request(app)
+    const res = await request(app)
       .post("/api/withdraw")
       .send({ applicationId: applyRes.body.applicationId })
       .expect(409);
+
+    expect(res.body.error.code).toBe("CONFLICT");
+    expect(res.body.error.message).toContain("already inactive");
   });
 });
 
@@ -335,75 +506,121 @@ describe("POST /api/withdraw", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("Full lifecycle — end to end", () => {
-  it("apply → acknowledge → withdraw → next promoted", async () => {
+  it("apply → acknowledge → withdraw → next promoted: every state transition verified", async () => {
     const db = getTestDb();
     const job = await seedJob({ capacity: 1 });
 
-    // Step 1: Alice applies (gets PENDING_ACKNOWLEDGMENT)
+    // Step 1: Alice applies (PENDING_ACKNOWLEDGMENT)
     const alice = await request(app)
       .post("/api/apply-public")
       .send({ name: "Alice", email: "alice@lifecycle.com", jobId: job.id })
       .expect(201);
     expect(alice.body.status).toBe("PENDING_ACKNOWLEDGMENT");
 
-    // Step 2: Bob applies (gets WAITLIST)
+    // Step 2: Bob applies (WAITLIST)
     const bob = await request(app)
       .post("/api/apply-public")
       .send({ name: "Bob", email: "bob@lifecycle.com", jobId: job.id })
       .expect(201);
     expect(bob.body.status).toBe("WAITLIST");
+    expect(bob.body.queuePosition).toBe(1);
 
-    // Step 3: Alice acknowledges (becomes ACTIVE)
+    // Step 3: Alice acknowledges (ACTIVE)
     const ack = await request(app)
       .post("/api/acknowledge")
       .send({ applicationId: alice.body.applicationId })
       .expect(200);
     expect(ack.body.status).toBe("ACTIVE");
 
-    // Step 4: Alice withdraws (INACTIVE, slot opens)
+    // Step 4: Alice withdraws (INACTIVE → Bob promoted)
     await request(app)
       .post("/api/withdraw")
       .send({ applicationId: alice.body.applicationId })
       .expect(200);
 
-    // Step 5: Bob should now be PENDING_ACKNOWLEDGMENT (promoted)
+    // ── Verify Alice is INACTIVE in DB ──
+    const [aliceApp] = await db
+      .select()
+      .from(applicationsTable)
+      .where(eq(applicationsTable.id, alice.body.applicationId));
+    expect(aliceApp.status).toBe("INACTIVE");
+
+    // ── Verify Bob promoted to PENDING in DB ──
     const [bobApp] = await db
       .select()
       .from(applicationsTable)
       .where(eq(applicationsTable.id, bob.body.applicationId));
     expect(bobApp.status).toBe("PENDING_ACKNOWLEDGMENT");
+    expect(bobApp.promotedAt).not.toBeNull();
 
-    // Step 6: Bob acknowledges
+    // Step 5: Bob acknowledges (ACTIVE)
     const bobAck = await request(app)
       .post("/api/acknowledge")
       .send({ applicationId: bob.body.applicationId })
       .expect(200);
     expect(bobAck.body.status).toBe("ACTIVE");
+
+    // ── Final DB state: Bob is ACTIVE, Alice is INACTIVE ──
+    const [bobFinal] = await db
+      .select()
+      .from(applicationsTable)
+      .where(eq(applicationsTable.id, bob.body.applicationId));
+    expect(bobFinal.status).toBe("ACTIVE");
+    expect(bobFinal.acknowledgedAt).not.toBeNull();
+
+    // ── Audit log count: comprehensive trail ──
+    const allLogs = await db.select().from(auditLogsTable);
+    // Alice: APPLIED, PROMOTED, ACKNOWLEDGED, WITHDRAWN
+    // Bob:   APPLIED, PROMOTED (after withdraw), ACKNOWLEDGED
+    // Total: 7 audit entries
+    expect(allLogs.length).toBe(7);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  6. Error responses — structured format
+//  6. Error responses — unified contract
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("Error response format", () => {
-  it("returns structured { error: { message, code } } on 404", async () => {
+describe("Error response format — unified contract", () => {
+  it("404 returns { error: { code, message, details } }", async () => {
     const res = await request(app)
       .post("/api/withdraw")
       .send({ applicationId: 99999 })
       .expect(404);
 
     expect(res.body.error).toBeDefined();
-    expect(res.body.error.message).toBeDefined();
     expect(res.body.error.code).toBe("NOT_FOUND");
+    expect(res.body.error.message).toBeDefined();
+    expect(typeof res.body.error.message).toBe("string");
+    expect(res.body.error.details).toBeNull();
   });
 
-  it("returns structured error on validation failure (missing body fields)", async () => {
+  it("400 returns { error: { code, message } } on validation failure", async () => {
     const res = await request(app)
       .post("/api/apply-public")
-      .send({}) // missing all fields
+      .send({})
       .expect(400);
 
     expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBeDefined();
+    expect(typeof res.body.error.message).toBe("string");
+  });
+
+  it("409 returns { error: { code, message, details: null } } on conflict", async () => {
+    const job = await seedJob({ capacity: 5 });
+
+    await request(app)
+      .post("/api/apply-public")
+      .send({ name: "Test", email: "conflict@test.com", jobId: job.id })
+      .expect(201);
+
+    const res = await request(app)
+      .post("/api/apply-public")
+      .send({ name: "Test", email: "conflict@test.com", jobId: job.id })
+      .expect(409);
+
+    expect(res.body.error).toBeDefined();
+    expect(res.body.error.code).toBe("DUPLICATE_SUBMISSION");
+    expect(res.body.error.details).toBeNull();
   });
 });
