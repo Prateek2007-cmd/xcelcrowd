@@ -411,23 +411,44 @@ export async function applyPublic(
 
     applicantId = created.id;
   } catch (err: any) {
-    // Handle duplicate email (Postgres)
+    // If already an AppError, re-throw as-is
+    if (err instanceof DatabaseError) {
+      throw err;
+    }
+
+    // Handle duplicate email (Postgres error code 23505)
     const errorCode = err?.code || err?.cause?.code;
 
     if (errorCode === "23505") {
-      const existing = await db
-        .select()
-        .from(applicantsTable)
-        .where(eq(applicantsTable.email, email))
-        .limit(1);
+      // Applicant with this email already exists — fetch and reuse
+      try {
+        const existing = await db
+          .select()
+          .from(applicantsTable)
+          .where(eq(applicantsTable.email, email))
+          .limit(1);
 
-      if (!existing || existing.length === 0) {
-        throw new Error("Applicant exists but could not be fetched");
+        if (!existing || existing.length === 0) {
+          throw new DatabaseError(
+            "Applicant exists (duplicate email constraint) but could not be fetched from database"
+          );
+        }
+
+        applicantId = existing[0].id;
+      } catch (fetchErr: any) {
+        // Wrap any fetch errors
+        if (fetchErr instanceof DatabaseError) {
+          throw fetchErr;
+        }
+        throw new DatabaseError(
+          "Failed to fetch existing applicant after detecting duplicate email"
+        );
       }
-
-      applicantId = existing[0].id;
     } else {
-      throw err;
+      // Wrap all other unknown errors (including internal DB errors)
+      throw new DatabaseError(
+        "Failed to create or resolve applicant"
+      );
     }
   }
 
