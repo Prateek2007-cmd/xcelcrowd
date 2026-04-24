@@ -3,9 +3,11 @@ import {
   applicationsTable,
   queuePositionsTable,
   auditLogsTable,
+  applicantsTable,
+  jobsTable,
   type ApplicationStatus,
 } from "@workspace/db";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, sql, lte } from "drizzle-orm";
 import { logger } from "../lib/logger";
 
 const ACKNOWLEDGE_WINDOW_MS = 5 * 60 * 1000;
@@ -402,6 +404,147 @@ export async function runDecayForJob(
     );
     return { decayed: 0, promoted: 0, success: false };
   }
+}
+
+/**
+ * Replay the pipeline state for a job as of a given point in time.
+ *
+ * Reconstructs the pipeline by:
+ *   1. Fetching all applications created on or before `asOf`
+ *   2. Replaying audit log events in chronological order to derive
+ *      each application's status at that moment
+ *   3. Partitioning into active vs waitlisted applicants
+ *
+ * This is a pure read operation — no state mutations.
+ * Previously lived inline in the route handler; extracted here
+ * so it can be reused and unit-tested independently.
+ */
+export async function replayPipeline(
+  jobId: number,
+  asOf: Date = new Date()
+): Promise<{
+  jobId: number;
+  asOf: string;
+  activeApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+  }>;
+  waitlistApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+  }>;
+  events: Array<{
+    id: number;
+    applicationId: number;
+    eventType: string;
+    fromStatus: string | null;
+    toStatus: string;
+    metadata: unknown;
+    createdAt: string;
+  }>;
+}> {
+  // Fetch all applications created on or before the replay timestamp
+  const apps = await db
+    .select({
+      applicationId: applicationsTable.id,
+      applicantId: applicantsTable.id,
+      applicantName: applicantsTable.name,
+    })
+    .from(applicationsTable)
+    .innerJoin(
+      applicantsTable,
+      eq(applicationsTable.applicantId, applicantsTable.id)
+    )
+    .where(
+      and(
+        eq(applicationsTable.jobId, jobId),
+        lte(applicationsTable.createdAt, asOf)
+      )
+    );
+
+  // Initialize every application as APPLIED (pre-pipeline state)
+  const replayState = new Map<number, string>();
+  for (const app of apps) {
+    replayState.set(app.applicationId, "APPLIED");
+  }
+
+  // Replay audit log events in chronological order to derive final state
+  const logs = await db
+    .select()
+    .from(auditLogsTable)
+    .innerJoin(
+      applicationsTable,
+      eq(auditLogsTable.applicationId, applicationsTable.id)
+    )
+    .where(
+      and(
+        eq(applicationsTable.jobId, jobId),
+        lte(auditLogsTable.createdAt, asOf)
+      )
+    )
+    .orderBy(auditLogsTable.createdAt);
+
+  for (const log of logs) {
+    replayState.set(log.audit_logs.applicationId, log.audit_logs.toStatus);
+  }
+
+  // Partition into active vs waitlist
+  const appMap = new Map(apps.map((a) => [a.applicationId, a]));
+
+  const activeApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+  }> = [];
+
+  const waitlistApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+  }> = [];
+
+  for (const [applicationId, status] of replayState.entries()) {
+    const app = appMap.get(applicationId);
+    if (!app) continue;
+
+    const entry = {
+      applicationId,
+      applicantId: app.applicantId,
+      applicantName: app.applicantName,
+      status,
+    };
+
+    if (status === "ACTIVE" || status === "PENDING_ACKNOWLEDGMENT") {
+      activeApplicants.push(entry);
+    } else if (status === "WAITLIST") {
+      waitlistApplicants.push(entry);
+    }
+  }
+
+  // Shape audit log events for the response
+  const events = logs.map((l) => ({
+    id: l.audit_logs.id,
+    applicationId: l.audit_logs.applicationId,
+    eventType: l.audit_logs.eventType,
+    fromStatus: l.audit_logs.fromStatus ?? null,
+    toStatus: l.audit_logs.toStatus,
+    metadata: l.audit_logs.metadata ?? null,
+    createdAt: l.audit_logs.createdAt.toISOString(),
+  }));
+
+  return {
+    jobId,
+    asOf: asOf.toISOString(),
+    activeApplicants,
+    waitlistApplicants,
+    events,
+  };
 }
 
 export const ACKNOWLEDGE_WINDOW_SECONDS = ACKNOWLEDGE_WINDOW_MS / 1000;

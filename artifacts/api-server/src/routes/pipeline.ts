@@ -4,7 +4,7 @@
  * Decay is handled solely by the background worker.
  */
 import { Router, type IRouter } from "express";
-import { eq, sql, and, lte } from "drizzle-orm";
+import { eq, sql, and } from "drizzle-orm";
 import { db } from "@workspace/db";
 import {
   jobsTable,
@@ -21,6 +21,8 @@ import {
 } from "@workspace/api-zod";
 import { validateParams } from "../middlewares/validate";
 import { NotFoundError, ValidationError } from "../lib/errors";
+import { replayPipeline } from "../services/pipeline";
+
 
 const router: IRouter = Router();
 
@@ -170,6 +172,7 @@ router.get("/pipeline/:jobId/replay", validateParams(ReplayPipelineParams), asyn
       throw new ValidationError(queryParsed.error.message);
     }
 
+    // Verify job exists before delegating to service
     const [job] = await db
       .select()
       .from(jobsTable)
@@ -181,100 +184,10 @@ router.get("/pipeline/:jobId/replay", validateParams(ReplayPipelineParams), asyn
 
     const asOf = queryParsed.data.asOf ? new Date(queryParsed.data.asOf) : new Date();
 
-    const apps = await db
-      .select({
-        applicationId: applicationsTable.id,
-        applicantId: applicantsTable.id,
-        applicantName: applicantsTable.name,
-      })
-      .from(applicationsTable)
-      .innerJoin(
-        applicantsTable,
-        eq(applicationsTable.applicantId, applicantsTable.id)
-      )
-      .where(
-        and(
-          eq(applicationsTable.jobId, job.id),
-          lte(applicationsTable.createdAt, asOf)
-        )
-      );
+    // All business logic delegated to service layer
+    const result = await replayPipeline(jobId, asOf);
 
-    const replayState = new Map<number, string>();
-
-    for (const app of apps) {
-      replayState.set(app.applicationId, "APPLIED");
-    }
-
-    const logs = await db
-      .select()
-      .from(auditLogsTable)
-      .innerJoin(
-        applicationsTable,
-        eq(auditLogsTable.applicationId, applicationsTable.id)
-      )
-      .where(
-        and(
-          eq(applicationsTable.jobId, job.id),
-          lte(auditLogsTable.createdAt, asOf)
-        )
-      )
-      .orderBy(auditLogsTable.createdAt);
-
-    for (const log of logs) {
-      replayState.set(log.audit_logs.applicationId, log.audit_logs.toStatus);
-    }
-
-    const appMap = new Map(apps.map((a) => [a.applicationId, a]));
-
-    const activeApplicants: {
-      applicationId: number;
-      applicantId: number;
-      applicantName: string;
-      status: string;
-    }[] = [];
-
-    const waitlistApplicants: {
-      applicationId: number;
-      applicantId: number;
-      applicantName: string;
-      status: string;
-    }[] = [];
-
-    for (const [applicationId, status] of replayState.entries()) {
-      const app = appMap.get(applicationId);
-      if (!app) continue;
-
-      const entry = {
-        applicationId,
-        applicantId: app.applicantId,
-        applicantName: app.applicantName,
-        status,
-      };
-
-      if (status === "ACTIVE" || status === "PENDING_ACKNOWLEDGMENT") {
-        activeApplicants.push(entry);
-      } else if (status === "WAITLIST") {
-        waitlistApplicants.push(entry);
-      }
-    }
-
-    const events = logs.map((l) => ({
-      id: l.audit_logs.id,
-      applicationId: l.audit_logs.applicationId,
-      eventType: l.audit_logs.eventType,
-      fromStatus: l.audit_logs.fromStatus ?? null,
-      toStatus: l.audit_logs.toStatus,
-      metadata: l.audit_logs.metadata ?? null,
-      createdAt: l.audit_logs.createdAt.toISOString(),
-    }));
-
-    res.json({
-      jobId: job.id,
-      asOf: asOf.toISOString(),
-      activeApplicants,
-      waitlistApplicants,
-      events,
-    });
+    res.json(result);
   } catch (err) {
     next(err);
   }
