@@ -9,6 +9,8 @@ import {
 } from "@workspace/db";
 import { eq, and, sql, lte } from "drizzle-orm";
 import { logger } from "../lib/logger";
+import { AppError } from "../lib/errors";
+import { getPgErrorCode } from "../lib/errorUtils";
 
 const ACKNOWLEDGE_WINDOW_MS = 5 * 60 * 1000;
 
@@ -371,33 +373,68 @@ export async function checkAndDecayExpiredAcknowledgments(
  *   - promoted: number of applications promoted to PENDING_ACKNOWLEDGMENT
  *   - success: whether the cycle completed without error
  */
+export interface DecayResult {
+  decayed: number;
+  promoted: number;
+  success: boolean;
+  error?: {
+    code: string;
+    message: string;
+    stage?: string;
+  };
+}
+
 export async function runDecayForJob(
   jobId: number,
   jobCapacity: number
-): Promise<{ decayed: number; promoted: number; success: boolean }> {
+): Promise<DecayResult> {
   try {
     const result = await db.transaction(async (tx) => {
-      // Decay expired acknowledgments AND promote until full in a single transaction
-      // This ensures expired applicants move to end-of-queue, then fresh promotions happen
       const decayed = await checkAndDecayExpiredAcknowledgments(jobId, jobCapacity, tx);
-      
-      // Note: promoteUntilFull is called INSIDE checkAndDecayExpiredAcknowledgments
-      // if any decay occurred, so we just return the decay count as a proxy for whether
-      // any "activity" happened. This maintains the single-transaction guarantee.
       return { decayed };
     });
 
     return {
       decayed: result.decayed,
-      promoted: result.decayed > 0 ? 1 : 0,  // simplified metric; actual promoted count is inside the tx
+      promoted: result.decayed > 0 ? 1 : 0,
       success: true,
     };
   } catch (err) {
+    // ── 1. Known application errors ──
+    if (err instanceof AppError) {
+      logger.error(
+        { jobId, errorCode: err.code, message: err.message, stage: "decay" },
+        `Pipeline error during decay cycle for job ${jobId}`
+      );
+      return {
+        decayed: 0, promoted: 0, success: false,
+        error: { code: err.code, message: err.message, stage: "decay" },
+      };
+    }
+
+    // ── 2. PostgreSQL constraint / connection errors ──
+    const pgCode = getPgErrorCode(err);
+    if (pgCode) {
+      logger.error(
+        { jobId, pgCode, stage: "decay", err },
+        `Database error (PG ${pgCode}) during decay cycle for job ${jobId}`
+      );
+      return {
+        decayed: 0, promoted: 0, success: false,
+        error: { code: `PG_${pgCode}`, message: `Database constraint error: ${pgCode}`, stage: "decay" },
+      };
+    }
+
+    // ── 3. Unknown / unexpected errors ──
+    const message = err instanceof Error ? err.message : String(err);
     logger.error(
-      { err, jobId },
-      "runDecayForJob: error during decay cycle for job"
+      { jobId, error: message, stack: err instanceof Error ? err.stack : undefined, stage: "decay" },
+      `Unexpected failure during decay cycle for job ${jobId}`
     );
-    return { decayed: 0, promoted: 0, success: false };
+    return {
+      decayed: 0, promoted: 0, success: false,
+      error: { code: "INTERNAL_ERROR", message: "Unexpected failure during decay", stage: "decay" },
+    };
   }
 }
 

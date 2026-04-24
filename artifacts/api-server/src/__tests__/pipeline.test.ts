@@ -425,7 +425,7 @@ describe("checkAndDecayExpiredAcknowledgments()", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 6. runDecayForJob — transaction wrapper
+// 6. runDecayForJob — structured error handling
 // ═══════════════════════════════════════════════════════════════════════════════
 describe("runDecayForJob()", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -438,7 +438,7 @@ describe("runDecayForJob()", () => {
     expect(db.transaction).toHaveBeenCalledTimes(1);
   });
 
-  it("returns success: true with decayed count on success", async () => {
+  it("returns success: true with decayed/promoted on success", async () => {
     vi.mocked(db.transaction).mockImplementation(async (fn: any) => {
       const tx = makeTx({ selectResults: [[]] });
       return fn(tx);
@@ -449,14 +449,54 @@ describe("runDecayForJob()", () => {
     expect(result.success).toBe(true);
     expect(result).toHaveProperty("decayed");
     expect(result).toHaveProperty("promoted");
+    expect(result.error).toBeUndefined();
   });
 
-  it("returns { success: false, decayed: 0, promoted: 0 } on error", async () => {
+  it("classifies AppError with code, message, and stage", async () => {
+    const { NotFoundError } = await import("../lib/errors");
+    vi.mocked(db.transaction).mockRejectedValue(new NotFoundError("Job", 10));
+
+    const result = await runDecayForJob(10, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.decayed).toBe(0);
+    expect(result.error).toBeDefined();
+    expect(result.error!.code).toBe("NOT_FOUND");
+    expect(result.error!.message).toContain("not found");
+    expect(result.error!.stage).toBe("decay");
+  });
+
+  it("classifies PostgreSQL constraint errors with PG_ prefix", async () => {
+    const pgErr = Object.assign(new Error("unique violation"), { code: "23505" });
+    vi.mocked(db.transaction).mockRejectedValue(pgErr);
+
+    const result = await runDecayForJob(10, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
+    expect(result.error!.code).toBe("PG_23505");
+    expect(result.error!.stage).toBe("decay");
+  });
+
+  it("classifies unknown errors as INTERNAL_ERROR", async () => {
     vi.mocked(db.transaction).mockRejectedValue(new Error("connection lost"));
 
     const result = await runDecayForJob(10, 5);
 
-    expect(result).toEqual({ success: false, decayed: 0, promoted: 0 });
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
+    expect(result.error!.code).toBe("INTERNAL_ERROR");
+    expect(result.error!.message).toBe("Unexpected failure during decay");
+    expect(result.error!.stage).toBe("decay");
+  });
+
+  it("handles non-Error thrown values gracefully", async () => {
+    vi.mocked(db.transaction).mockRejectedValue("string error");
+
+    const result = await runDecayForJob(10, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.error!.code).toBe("INTERNAL_ERROR");
   });
 });
 
