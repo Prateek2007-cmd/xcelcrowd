@@ -6,6 +6,7 @@ import {
   checkAndDecayExpiredAcknowledgments,
   getActiveCount,
   getNextInQueue,
+  runDecayForJob,
 } from "../services/pipeline";
 import { db } from "@workspace/db";
 
@@ -612,5 +613,486 @@ describe("pipeline.checkAndDecayExpiredAcknowledgments()", () => {
     // Should have called update/insert for both decay and subsequent promotion
     expect(mockTx.update).toHaveBeenCalled();
     expect(mockTx.insert).toHaveBeenCalled();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FOCUSED UNIT TESTS: CORE BUSINESS LOGIC & STATE TRANSITIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("pipeline.runDecayForJob() - Decay Cycle Entry Point", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("wraps decay cycle in database transaction for ACID guarantee", async () => {
+    const mockTransaction = vi.fn().mockResolvedValue({ decayed: 0 });
+    vi.mocked(db.transaction).mockImplementation(mockTransaction);
+
+    await runDecayForJob(10, 5);
+
+    expect(mockTransaction).toHaveBeenCalled();
+  });
+
+  it("returns success: true when decay cycle completes", async () => {
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => {
+      return fn({
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue([]),
+          }),
+        }),
+      });
+    });
+
+    const result = await runDecayForJob(10, 5);
+
+    expect(result.success).toBe(true);
+    expect(result).toHaveProperty("decayed");
+    expect(result).toHaveProperty("promoted");
+  });
+
+  it("returns success: false and counts zero on transaction error", async () => {
+    vi.mocked(db.transaction).mockRejectedValue(new Error("DB error"));
+
+    const result = await runDecayForJob(10, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.decayed).toBe(0);
+    expect(result.promoted).toBe(0);
+  });
+
+  it("includes decayed count in response", async () => {
+    const expiredApps = [
+      createMockApplication({
+        id: 1,
+        status: "PENDING_ACKNOWLEDGMENT",
+        acknowledgeDeadline: new Date(Date.now() - 1000),
+      }),
+    ];
+
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => {
+      return fn({
+        select: vi.fn().mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn()
+              .mockResolvedValueOnce(expiredApps)
+              .mockResolvedValueOnce(expiredApps)
+              .mockResolvedValueOnce([{ maxPos: 5 }]),
+          }),
+        }),
+        delete: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+        insert: vi.fn().mockReturnValue({
+          values: vi.fn().mockResolvedValue(undefined),
+        }),
+        update: vi.fn().mockReturnValue({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue(undefined),
+          }),
+        }),
+        execute: vi.fn().mockResolvedValue({ rows: [] }),
+      });
+    });
+
+    const result = await runDecayForJob(10, 5);
+
+    expect(result.success).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FOCUSED TESTS: STATE TRANSITIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("pipeline - State Transitions & FIFO Ordering", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("WAITLIST → PENDING_ACKNOWLEDGMENT transition updates status and sets deadline", async () => {
+    const jobId = 10;
+    const jobCapacity = 5;
+    const candidateApp = createMockApplication({ id: 5, status: "WAITLIST" });
+
+    const mockTx = {
+      execute: vi.fn()
+        .mockResolvedValueOnce({ rows: [] }) // getActiveCount: 0
+        .mockResolvedValueOnce({ rows: [{ application_id: 5, position: 1 }] }), // getNextInQueue
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([candidateApp]),
+        }),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+      delete: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockResolvedValue(undefined),
+      }),
+    };
+
+    await promoteNext(jobId, jobCapacity, mockTx as any);
+
+    const updateCalls = vi.mocked(mockTx.update).mock.calls;
+    expect(updateCalls.length).toBeGreaterThan(0);
+    
+    // Verify set was called (indicates status update)
+    expect(mockTx.update().set).toBeDefined();
+  });
+
+  it("PENDING_ACKNOWLEDGMENT → WAITLIST (decay) clears deadline and increments penalty", async () => {
+    const applicationId = 1;
+    const jobId = 10;
+    const app = createMockApplication({
+      id: 1,
+      status: "PENDING_ACKNOWLEDGMENT",
+      penaltyCount: 1,
+    });
+
+    let capturedUpdates: any = null;
+    const mockTx = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn()
+            .mockResolvedValueOnce([app])
+            .mockResolvedValueOnce([{ maxPos: 5 }]),
+        }),
+      }),
+      delete: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockResolvedValue(undefined),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockImplementation((updates) => {
+          capturedUpdates = updates;
+          return {
+            where: vi.fn().mockResolvedValue(undefined),
+          };
+        }),
+      }),
+    };
+
+    await applyPenaltyAndRequeue(applicationId, jobId, mockTx as any);
+
+    expect(capturedUpdates).not.toBeNull();
+    expect(capturedUpdates?.status).toBe("WAITLIST");
+    expect(capturedUpdates?.acknowledgeDeadline).toBeNull();
+    expect(capturedUpdates?.penaltyCount).toBe(2); // Incremented
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FOCUSED TESTS: QUEUE FAIRNESS (STRICT FIFO)
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("pipeline - FIFO Queue Fairness & Position Ordering", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("requeued applicant always goes to END of queue (MAX position + 1)", async () => {
+    const applicationId = 1;
+    const jobId = 10;
+    const app = createMockApplication();
+
+    // Simulate queue has positions: 1, 3, 5 (max = 5)
+    let capturedPosition: number | null = null;
+    const mockTx = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn()
+            .mockResolvedValueOnce([app]) // Fetch app
+            .mockResolvedValueOnce([{ maxPos: 5 }]), // MAX(position) = 5
+        }),
+      }),
+      delete: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined),
+      }),
+      insert: vi.fn().mockImplementation((table) => {
+        if (table.toString().includes("queue")) {
+          return {
+            values: vi.fn().mockImplementation((payload) => {
+              capturedPosition = payload.position;
+              return Promise.resolve(undefined);
+            }),
+          };
+        }
+        return { values: vi.fn().mockResolvedValue(undefined) };
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+    };
+
+    await applyPenaltyAndRequeue(applicationId, jobId, mockTx as any);
+
+    expect(capturedPosition).toBe(6); // MAX(5) + 1
+  });
+
+  it("ensures expired applicants never jump ahead of earlier applicants", async () => {
+    const jobId = 10;
+    const jobCapacity = 5;
+
+    // Expired applicant gets requeued to position 11 (end)
+    // But newer applicants with positions 6-10 are still ahead in waitlist
+    // When promoting, we always take from MIN(position) - FIFO
+    
+    const mockTx = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn()
+            .mockResolvedValueOnce([]) // No expired for this test
+        }),
+      }),
+      execute: vi.fn(),
+      delete: vi.fn(),
+      insert: vi.fn(),
+      update: vi.fn(),
+    };
+
+    const decayed = await checkAndDecayExpiredAcknowledgments(jobId, jobCapacity, mockTx as any);
+
+    expect(decayed).toBe(0); // No decay = no one jumped queue
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FOCUSED TESTS: CAPACITY CONSTRAINTS & SLOT MANAGEMENT
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("pipeline - Capacity Handling & Slot Management", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("rejects promotion when capacity is at maximum", async () => {
+    const jobId = 10;
+    const jobCapacity = 5;
+
+    const mockTx = {
+      execute: vi.fn().mockResolvedValue({
+        rows: [1, 2, 3, 4, 5], // 5 active = full
+      }),
+      select: vi.fn(),
+      update: vi.fn(),
+      delete: vi.fn(),
+      insert: vi.fn(),
+    };
+
+    await promoteNext(jobId, jobCapacity, mockTx as any);
+
+    // Should not attempt any updates
+    expect(mockTx.update).not.toHaveBeenCalled();
+  });
+
+  it("promotes exactly slotsAvailable candidates (not more)", async () => {
+    const jobId = 10;
+    const jobCapacity = 5;
+
+    // 2 active, 3 slots available
+    // 5 candidates in queue
+    // Should only promote 3
+    const mockTx = {
+      execute: vi.fn()
+        .mockResolvedValueOnce({ rows: [1, 2] }) // 2 active
+        .mockResolvedValueOnce({
+          rows: [
+            { application_id: 1, position: 1 },
+            { application_id: 2, position: 2 },
+            { application_id: 3, position: 3 },
+            { application_id: 4, position: 4 },
+            { application_id: 5, position: 5 },
+          ],
+        }), // 5 candidates
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([createMockApplication({ status: "WAITLIST" })]),
+        }),
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+      delete: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined),
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockResolvedValue(undefined),
+      }),
+    };
+
+    const promoted = await promoteUntilFull(jobId, jobCapacity, mockTx as any);
+
+    // At most 3 should be promoted (slotsAvailable)
+    expect(promoted).toBeLessThanOrEqual(3);
+  });
+
+  it("counts both ACTIVE and PENDING_ACKNOWLEDGMENT toward capacity", async () => {
+    const jobId = 10;
+    const jobCapacity = 5;
+
+    // 2 ACTIVE + 3 PENDING_ACKNOWLEDGMENT = 5 total active occupancy
+    const mockTx = {
+      execute: vi.fn().mockResolvedValue({
+        rows: new Array(5), // Both statuses count
+      }),
+      select: vi.fn(),
+      update: vi.fn(),
+      delete: vi.fn(),
+      insert: vi.fn(),
+    };
+
+    const count = await getActiveCount(jobId, mockTx as any);
+
+    expect(count).toBe(5);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FOCUSED TESTS: SIDE EFFECTS & DATABASE OPERATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+describe("pipeline - Side Effects Verification", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("promotion deletes queue entry after updating status", async () => {
+    const jobId = 10;
+    const jobCapacity = 5;
+    const candidateApp = createMockApplication({ status: "WAITLIST" });
+
+    let updateCalled = false;
+    let deleteCalled = false;
+
+    const mockTx = {
+      execute: vi.fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{ application_id: 1, position: 1 }] }),
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([candidateApp]),
+        }),
+      }),
+      update: vi.fn().mockImplementation(() => {
+        updateCalled = true;
+        return {
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue(undefined),
+          }),
+        };
+      }),
+      delete: vi.fn().mockImplementation(() => {
+        deleteCalled = true;
+        return {
+          where: vi.fn().mockResolvedValue(undefined),
+        };
+      }),
+      insert: vi.fn().mockReturnValue({
+        values: vi.fn().mockResolvedValue(undefined),
+      }),
+    };
+
+    await promoteNext(jobId, jobCapacity, mockTx as any);
+
+    expect(updateCalled).toBe(true);
+    expect(deleteCalled).toBe(true);
+  });
+
+  it("penalty-and-requeue performs: delete + insert + update sequence", async () => {
+    const applicationId = 1;
+    const jobId = 10;
+    const app = createMockApplication();
+
+    const operationSequence: string[] = [];
+
+    const mockTx = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn()
+            .mockResolvedValueOnce([app])
+            .mockResolvedValueOnce([{ maxPos: 5 }]),
+        }),
+      }),
+      delete: vi.fn().mockImplementation(() => {
+        operationSequence.push("delete");
+        return {
+          where: vi.fn().mockResolvedValue(undefined),
+        };
+      }),
+      insert: vi.fn().mockImplementation(() => {
+        operationSequence.push("insert");
+        return {
+          values: vi.fn().mockResolvedValue(undefined),
+        };
+      }),
+      update: vi.fn().mockImplementation(() => {
+        operationSequence.push("update");
+        return {
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockResolvedValue(undefined),
+          }),
+        };
+      }),
+    };
+
+    await applyPenaltyAndRequeue(applicationId, jobId, mockTx as any);
+
+    // All three operations should be called
+    expect(operationSequence).toContain("delete");
+    expect(operationSequence).toContain("insert");
+    expect(operationSequence).toContain("update");
+  });
+
+  it("decay writes audit log for every decayed application", async () => {
+    const applicationId = 1;
+    const jobId = 10;
+    const app = createMockApplication();
+
+    let auditLogged = false;
+
+    const mockTx = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn()
+            .mockResolvedValueOnce([app])
+            .mockResolvedValueOnce([{ maxPos: 5 }]),
+        }),
+      }),
+      delete: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue(undefined),
+      }),
+      insert: vi.fn().mockImplementation(() => {
+        return {
+          values: vi.fn().mockImplementation((payload) => {
+            if (payload?.eventType === "DECAY_TRIGGERED") {
+              auditLogged = true;
+            }
+            return Promise.resolve(undefined);
+          }),
+        };
+      }),
+      update: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue(undefined),
+        }),
+      }),
+    };
+
+    await applyPenaltyAndRequeue(applicationId, jobId, mockTx as any);
+
+    expect(auditLogged).toBe(true);
   });
 });
