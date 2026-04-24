@@ -21,6 +21,12 @@ import {
   GoneError,
   DatabaseError,
 } from "../lib/errors";
+import {
+  getPgErrorCode,
+  isError,
+  formatErrorMessage,
+  classifyDbErrorOrDefault,
+} from "../lib/errorUtils";
 import { assertValidTransition } from "../lib/stateMachine";
 import {
   getActiveCount,
@@ -30,37 +36,7 @@ import {
 } from "./pipeline";
 import { logger } from "../lib/logger";
 
-// ── Error classification helpers ──────────────────────────────────
-
-/**
- * Extract PostgreSQL error code from various error structures.
- * PostgreSQL errors can appear in multiple places depending on the driver.
- */
-function getPgErrorCode(err: unknown): string | undefined {
-  if (!err || typeof err !== "object") return undefined;
-
-  const errObj = err as Record<string, unknown>;
-  return (errObj.code as string) || (errObj.cause as Record<string, unknown>)?.code as string;
-}
-
-/**
- * Type guard to check if error is an instance of Error.
- */
-function isError(err: unknown): err is Error {
-  return err instanceof Error;
-}
-
-/**
- * Format unknown error for logging and error messages.
- */
-function formatErrorMessage(err: unknown): string {
-  if (isError(err)) return err.message;
-  if (typeof err === "string") return err;
-  if (typeof err === "object" && err !== null && "message" in err) {
-    return String((err as Record<string, unknown>).message);
-  }
-  return String(err);
-}
+// Error classification helpers imported from ../lib/errorUtils
 
 // ── Result types (pure data, no side effects) ──────────────────────
 
@@ -443,12 +419,12 @@ export async function applyPublic(
 
     applicantId = created.id;
   } catch (err: unknown) {
-    // ── Handle known application errors ──
+    // ── Handle known application errors (pass through) ──
     if (err instanceof DatabaseError) {
       throw err;
     }
 
-    // ── Handle PostgreSQL duplicate constraint (23505) ──
+    // ── Classify via centralized utility ──
     const pgErrorCode = getPgErrorCode(err);
     const errorMessage = formatErrorMessage(err);
 
@@ -463,16 +439,11 @@ export async function applyPublic(
 
         if (!existing || existing.length === 0) {
           logger.error(
-            {
-              errorCode: pgErrorCode,
-              email,
-              errorType: "CONSTRAINT_MISMATCH",
-            },
+            { errorCode: pgErrorCode, email, errorType: "CONSTRAINT_MISMATCH" },
             "Duplicate email constraint failed: applicant not found after detecting constraint"
           );
           throw new DatabaseError(
-            "Applicant exists (duplicate email constraint) but could not be fetched from database",
-            { cause: "Constraint detected but query returned empty" }
+            "Applicant exists (duplicate email constraint) but could not be fetched from database"
           );
         }
 
@@ -482,29 +453,14 @@ export async function applyPublic(
           "Duplicate applicant detected, reusing existing applicant"
         );
       } catch (fetchErr: unknown) {
-        // ── Handle fetch errors after constraint detection ──
-        if (fetchErr instanceof DatabaseError) {
-          throw fetchErr;
-        }
-
-        const fetchErrorMessage = formatErrorMessage(fetchErr);
-        logger.error(
-          {
-            originalError: errorMessage,
-            fetchError: fetchErrorMessage,
-            email,
-            errorType: "FETCH_AFTER_CONSTRAINT",
-          },
+        // Re-throw AppErrors (including DatabaseError above)
+        throw classifyDbErrorOrDefault(
+          fetchErr,
           "Failed to fetch existing applicant after detecting duplicate email"
-        );
-
-        throw new DatabaseError(
-          "Failed to fetch existing applicant after detecting duplicate email",
-          { cause: fetchErrorMessage }
         );
       }
     } else {
-      // ── Handle all other unknown errors ──
+      // ── All other DB errors → centralized classification ──
       logger.error(
         {
           errorCode: pgErrorCode || "unknown",
@@ -515,13 +471,7 @@ export async function applyPublic(
         "Unknown database error during applicant creation or resolution"
       );
 
-      throw new DatabaseError(
-        "Failed to create or resolve applicant",
-        {
-          cause: errorMessage,
-          code: pgErrorCode,
-        }
-      );
+      throw classifyDbErrorOrDefault(err, "Failed to create or resolve applicant");
     }
   }
 

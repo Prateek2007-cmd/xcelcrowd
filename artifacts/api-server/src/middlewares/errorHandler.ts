@@ -3,6 +3,7 @@
  *
  * - Catches AppError subclasses and returns structured JSON
  * - Maps PostgreSQL constraint violation codes to proper API responses
+ *   via the centralized classifyDbError utility (single source of truth)
  * - Handles Zod validation errors explicitly
  * - Catches unknown errors and returns 500 with generic message
  */
@@ -10,53 +11,11 @@ import type { Request, Response, NextFunction } from "express";
 import { ZodError } from "zod";
 import {
   AppError,
-  ConflictError,
   ValidationError,
   DatabaseError,
 } from "../lib/errors";
+import { classifyDbError } from "../lib/errorUtils";
 import { logger } from "../lib/logger";
-
-/**
- * PostgreSQL error code mapping.
- */
-function mapPostgresError(err: unknown): AppError | null {
-  if (!err || typeof err !== "object") return null;
-
-  const pgErr = err as { code?: string; constraint?: string; detail?: string };
-
-  switch (pgErr.code) {
-    case "23505":
-      return new ConflictError(
-        pgErr.detail
-          ? `Duplicate entry: ${pgErr.detail}`
-          : "A record with this value already exists"
-      );
-
-    case "23503":
-      return new ValidationError(
-        pgErr.detail
-          ? `Referenced record not found: ${pgErr.detail}`
-          : "Referenced record does not exist"
-      );
-
-    case "23502":
-      return new ValidationError(
-        pgErr.detail
-          ? `Missing required field: ${pgErr.detail}`
-          : "A required field is missing"
-      );
-
-    case "23514":
-      return new ValidationError(
-        pgErr.detail
-          ? `Constraint violation: ${pgErr.detail}`
-          : "A value constraint was violated"
-      );
-
-    default:
-      return null;
-  }
-}
 
 // Express error handler
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -72,8 +31,8 @@ export function errorHandler(
     return;
   }
 
-  // 2. PostgreSQL constraint errors
-  const pgMapped = mapPostgresError(err);
+  // 2. PostgreSQL constraint errors (centralized classification)
+  const pgMapped = classifyDbError(err);
   if (pgMapped) {
     logger.warn({ err, mapped: pgMapped.code }, "Database constraint violation");
     res.status(pgMapped.statusCode).json(pgMapped.toJSON());
@@ -101,4 +60,4 @@ export function errorHandler(
 
   const fallback = new DatabaseError("An unexpected error occurred");
   res.status(500).json(fallback.toJSON());
-}
+}
