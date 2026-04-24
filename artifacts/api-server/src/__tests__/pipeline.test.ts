@@ -466,7 +466,7 @@ describe("runDecayForJob()", () => {
     expect(result.error!.stage).toBe("decay");
   });
 
-  it("classifies PostgreSQL constraint errors with PG_ prefix", async () => {
+  it("classifies PostgreSQL constraint errors with semantic type", async () => {
     const pgErr = Object.assign(new Error("unique violation"), { code: "23505" });
     vi.mocked(db.transaction).mockRejectedValue(pgErr);
 
@@ -474,19 +474,19 @@ describe("runDecayForJob()", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBeDefined();
-    expect(result.error!.code).toBe("PG_23505");
+    expect(result.error!.code).toBe("UNIQUE_VIOLATION");
     expect(result.error!.stage).toBe("decay");
   });
 
-  it("classifies unknown errors as INTERNAL_ERROR", async () => {
+  it("classifies unknown errors as PIPELINE_ERROR", async () => {
     vi.mocked(db.transaction).mockRejectedValue(new Error("connection lost"));
 
     const result = await runDecayForJob(10, 5);
 
     expect(result.success).toBe(false);
     expect(result.error).toBeDefined();
-    expect(result.error!.code).toBe("INTERNAL_ERROR");
-    expect(result.error!.message).toBe("Unexpected failure during decay");
+    expect(result.error!.code).toBe("PIPELINE_ERROR");
+    expect(result.error!.message).toContain("Unexpected failure during decay");
     expect(result.error!.stage).toBe("decay");
   });
 
@@ -496,7 +496,7 @@ describe("runDecayForJob()", () => {
     const result = await runDecayForJob(10, 5);
 
     expect(result.success).toBe(false);
-    expect(result.error!.code).toBe("INTERNAL_ERROR");
+    expect(result.error!.code).toBe("PIPELINE_ERROR");
   });
 });
 

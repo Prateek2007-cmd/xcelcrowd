@@ -78,7 +78,24 @@ export class InvalidTransitionError extends AppError {
 
 /** 500 — Internal / database errors */
 export class DatabaseError extends AppError {
-  constructor(message: string = "A database error occurred") {
+  constructor(message: string = "A database error occurred", options?: { cause?: unknown }) {
     super(message, 500, "DATABASE_ERROR");
+    if (options?.cause) this.cause = options.cause;
+  }
+}
+
+/** 500 — Pipeline-specific operational failures (decay, promotion, requeue) */
+export class PipelineError extends AppError {
+  readonly jobId: number;
+  readonly stage: string;
+
+  constructor(
+    message: string,
+    opts: { jobId: number; stage: string; cause?: unknown }
+  ) {
+    super(message, 500, "PIPELINE_ERROR");
+    this.jobId = opts.jobId;
+    this.stage = opts.stage;
+    if (opts.cause) this.cause = opts.cause;
   }
 }

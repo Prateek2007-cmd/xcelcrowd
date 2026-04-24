@@ -5,7 +5,7 @@ import { db } from "@workspace/db";
 import { applicationsTable, queuePositionsTable, auditLogsTable } from "@workspace/db";
 import { eq, and, sql } from "drizzle-orm";
 import { logger } from "../../lib/logger";
-import { AppError } from "../../lib/errors";
+import { AppError, PipelineError, DatabaseError } from "../../lib/errors";
 import { mapDbError } from "../../lib/dbErrorMapper";
 import type { TxHandle, DecayResult } from "./types";
 import { promoteUntilFull } from "./promote";
@@ -110,7 +110,13 @@ export async function checkAndDecayExpiredAcknowledgments(
 
 /**
  * Execute a complete decay cycle for a single job (transaction wrapper).
- * Primary entry point called by decayWorker.
+ *
+ * Error strategy:
+ *   1. AppError subclasses → pass through (already classified)
+ *   2. Database errors → wrap in PipelineError with cause
+ *   3. Unknown errors → wrap in PipelineError with cause
+ *
+ * The original error is ALWAYS preserved as `cause` for debugging.
  */
 export async function runDecayForJob(
   jobId: number,
@@ -128,6 +134,7 @@ export async function runDecayForJob(
       success: true,
     };
   } catch (err) {
+    // ── 1. Known application errors — pass through with context ──
     if (err instanceof AppError) {
       logger.error(
         { jobId, errorCode: err.code, message: err.message, stage: "decay" },
@@ -139,27 +146,41 @@ export async function runDecayForJob(
       };
     }
 
-    // ── 2. Database errors (semantic mapping) ──
+    // ── 2. Database errors — wrap with semantic type + cause ──
     const dbErr = mapDbError(err);
     if (dbErr) {
+      const wrapped = new PipelineError(
+        `Database error during decay: ${dbErr.type}`,
+        { jobId, stage: "decay", cause: err }
+      );
       logger.error(
-        { jobId, errorType: dbErr.type, rawCode: dbErr.rawCode, stage: "decay", err },
-        `Database error (${dbErr.type}) during decay cycle for job ${jobId}`
+        { jobId, errorType: dbErr.type, rawCode: dbErr.rawCode, stage: "decay", cause: wrapped.cause },
+        wrapped.message
       );
       return {
         decayed: 0, promoted: 0, success: false,
-        error: { code: dbErr.type, message: `Database error: ${dbErr.type}`, stage: "decay" },
+        error: { code: dbErr.type, message: wrapped.message, stage: "decay" },
       };
     }
 
-    const message = err instanceof Error ? err.message : String(err);
+    // ── 3. Unknown — wrap everything with cause for debugging ──
+    const wrapped = new PipelineError(
+      "Unexpected failure during decay",
+      { jobId, stage: "decay", cause: err }
+    );
     logger.error(
-      { jobId, error: message, stack: err instanceof Error ? err.stack : undefined, stage: "decay" },
-      `Unexpected failure during decay cycle for job ${jobId}`
+      {
+        jobId,
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+        stage: "decay",
+      },
+      wrapped.message
     );
     return {
       decayed: 0, promoted: 0, success: false,
-      error: { code: "INTERNAL_ERROR", message: "Unexpected failure during decay", stage: "decay" },
+      error: { code: "PIPELINE_ERROR", message: wrapped.message, stage: "decay" },
     };
   }
 }
+

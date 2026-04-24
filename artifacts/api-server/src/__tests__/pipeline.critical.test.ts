@@ -478,3 +478,113 @@ describe("Partial failure safety", () => {
     expect(count).toBe(0);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  8. ERROR CLASSIFICATION — runDecayForJob wraps errors with context
+// ═══════════════════════════════════════════════════════════════════════════════
+import { runDecayForJob } from "../services/pipeline";
+import { AppError, PipelineError, DatabaseError } from "../lib/errors";
+import { DbErrorType } from "../lib/dbErrorMapper";
+
+// Need to mock db.transaction for runDecayForJob tests
+import { db } from "@workspace/db";
+
+describe("runDecayForJob error classification", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("AppError passes through with correct code and stage", async () => {
+    const appErr = new DatabaseError("Connection pool exhausted");
+    vi.mocked(db.transaction).mockRejectedValueOnce(appErr);
+
+    const result = await runDecayForJob(42, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.decayed).toBe(0);
+    expect(result.promoted).toBe(0);
+    expect(result.error).toBeDefined();
+    expect(result.error!.code).toBe("DATABASE_ERROR");
+    expect(result.error!.message).toBe("Connection pool exhausted");
+    expect(result.error!.stage).toBe("decay");
+  });
+
+  it("PostgreSQL unique_violation gets semantic DbErrorType code", async () => {
+    const pgErr = Object.assign(new Error("unique violation"), { code: "23505" });
+    vi.mocked(db.transaction).mockRejectedValueOnce(pgErr);
+
+    const result = await runDecayForJob(42, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.error!.code).toBe(DbErrorType.UNIQUE_VIOLATION);
+    expect(result.error!.message).toContain("UNIQUE_VIOLATION");
+    expect(result.error!.stage).toBe("decay");
+  });
+
+  it("PostgreSQL foreign_key violation maps to correct semantic type", async () => {
+    const pgErr = Object.assign(new Error("fk violation"), { code: "23503" });
+    vi.mocked(db.transaction).mockRejectedValueOnce(pgErr);
+
+    const result = await runDecayForJob(42, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.error!.code).toBe(DbErrorType.FOREIGN_KEY_VIOLATION);
+    expect(result.error!.stage).toBe("decay");
+  });
+
+  it("unknown errors get PIPELINE_ERROR code with stage context", async () => {
+    const weirdErr = "something completely unexpected";
+    vi.mocked(db.transaction).mockRejectedValueOnce(weirdErr);
+
+    const result = await runDecayForJob(42, 5);
+
+    expect(result.success).toBe(false);
+    expect(result.error!.code).toBe("PIPELINE_ERROR");
+    expect(result.error!.message).toContain("Unexpected failure during decay");
+    expect(result.error!.stage).toBe("decay");
+  });
+
+  it("successful decay cycle returns correct counts", async () => {
+    vi.mocked(db.transaction).mockImplementationOnce(async (fn) => {
+      return { decayed: 3 };
+    });
+
+    const result = await runDecayForJob(42, 5);
+
+    expect(result.success).toBe(true);
+    expect(result.decayed).toBe(3);
+    expect(result.promoted).toBe(1);
+    expect(result.error).toBeUndefined();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  9. PipelineError structure — validates the new error class
+// ═══════════════════════════════════════════════════════════════════════════════
+describe("PipelineError class", () => {
+  it("preserves cause chain for debugging", () => {
+    const original = new Error("connection reset");
+    const pipeErr = new PipelineError("Decay failed", {
+      jobId: 42,
+      stage: "decay",
+      cause: original,
+    });
+
+    expect(pipeErr).toBeInstanceOf(AppError);
+    expect(pipeErr.code).toBe("PIPELINE_ERROR");
+    expect(pipeErr.statusCode).toBe(500);
+    expect(pipeErr.jobId).toBe(42);
+    expect(pipeErr.stage).toBe("decay");
+    expect(pipeErr.cause).toBe(original);
+    expect(pipeErr.message).toBe("Decay failed");
+  });
+
+  it("works without cause (optional)", () => {
+    const pipeErr = new PipelineError("Queue corruption", {
+      jobId: 99,
+      stage: "promote",
+    });
+
+    expect(pipeErr.cause).toBeUndefined();
+    expect(pipeErr.jobId).toBe(99);
+    expect(pipeErr.stage).toBe("promote");
+  });
+});
