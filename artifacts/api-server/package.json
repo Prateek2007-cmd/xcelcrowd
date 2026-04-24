@@ -8,9 +8,11 @@
     "build": "node ./build.mjs",
     "start": "node --enable-source-maps --env-file=.env ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --exclude='src/__tests__/integration.test.ts' --exclude='src/__tests__/api.integration.test.ts'",
+    "test": "vitest run --exclude='src/__tests__/integration.test.ts' --exclude='src/__tests__/api.integration.test.ts' --exclude='src/__tests__/pipeline.integration.test.ts'",
     "test:integration": "vitest run src/__tests__/integration.test.ts",
     "test:api": "vitest run src/__tests__/api.integration.test.ts",
+    "test:pipeline-integration": "vitest run src/__tests__/pipeline.integration.test.ts",
+    "test:all-integration": "vitest run src/__tests__/integration.test.ts src/__tests__/api.integration.test.ts src/__tests__/pipeline.integration.test.ts",
     "test:all": "vitest run",
     "test:watch": "vitest"
   },
