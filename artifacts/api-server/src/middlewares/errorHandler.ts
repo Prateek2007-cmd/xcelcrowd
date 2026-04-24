@@ -1,23 +1,29 @@
 /**
  * Global Express error handling middleware.
  *
- * - Catches AppError subclasses and returns structured JSON
- * - Maps PostgreSQL constraint violation codes to proper API responses
- *   via the centralized classifyDbError utility (single source of truth)
- * - Handles Zod validation errors explicitly
- * - Catches unknown errors and returns 500 with generic message
+ * UNIFIED API ERROR CONTRACT:
+ *   Every error response follows the same structure:
+ *
+ *   {
+ *     error: {
+ *       code: string,           // machine-readable error code
+ *       message: string,        // human-readable message
+ *       details?: unknown       // optional structured details (Zod issues, etc.)
+ *     }
+ *   }
+ *
+ * Handles:
+ *   1. AppError subclasses — known application errors
+ *   2. PostgreSQL constraint violations — via centralized classifyDbError
+ *   3. ZodError — validation failures with field-level details
+ *   4. Unknown errors — 500 with generic message (no leaking internals)
  */
 import type { Request, Response, NextFunction } from "express";
 import { ZodError } from "zod";
-import {
-  AppError,
-  ValidationError,
-  DatabaseError,
-} from "../lib/errors";
+import { AppError } from "../lib/errors";
 import { classifyDbError } from "../lib/errorUtils";
 import { logger } from "../lib/logger";
 
-// Express error handler
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function errorHandler(
   err: unknown,
@@ -25,39 +31,55 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
-  // 1. Known application errors
+  // ── 1. Known application errors ──────────────────────────────────────────
   if (err instanceof AppError) {
-    res.status(err.statusCode).json(err.toJSON());
-    return;
-  }
-
-  // 2. PostgreSQL constraint errors (centralized classification)
-  const pgMapped = classifyDbError(err);
-  if (pgMapped) {
-    logger.warn({ err, mapped: pgMapped.code }, "Database constraint violation");
-    res.status(pgMapped.statusCode).json(pgMapped.toJSON());
-    return;
-  }
-
-  // 3. Zod validation errors (EXPLICIT handling)
-  if (err instanceof ZodError) {
-    const mapped = new ValidationError(
-      err.issues.map((i) => i.message).join(", ")
-    );
-
-    res.status(mapped.statusCode).json({
-      error: "ValidationError",
-      details: err.issues.map((i) => ({
-        path: i.path.join("."),
-        message: i.message,
-      })),
+    res.status(err.statusCode).json({
+      error: {
+        code: err.code,
+        message: err.message,
+        details: null,
+      },
     });
     return;
   }
 
-  // 4. Unknown errors
+  // ── 2. PostgreSQL constraint violations ──────────────────────────────────
+  const pgMapped = classifyDbError(err);
+  if (pgMapped) {
+    logger.warn({ err, mapped: pgMapped.code }, "Database constraint violation");
+    res.status(pgMapped.statusCode).json({
+      error: {
+        code: pgMapped.code,
+        message: pgMapped.message,
+        details: null,
+      },
+    });
+    return;
+  }
+
+  // ── 3. Zod validation errors ─────────────────────────────────────────────
+  if (err instanceof ZodError) {
+    res.status(400).json({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "Invalid request data",
+        details: err.issues.map((issue) => ({
+          field: issue.path.join("."),
+          message: issue.message,
+        })),
+      },
+    });
+    return;
+  }
+
+  // ── 4. Unknown / unhandled errors ────────────────────────────────────────
   logger.error({ err }, "Unhandled error");
 
-  const fallback = new DatabaseError("An unexpected error occurred");
-  res.status(500).json(fallback.toJSON());
-}
+  res.status(500).json({
+    error: {
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Something went wrong",
+      details: null,
+    },
+  });
+}
