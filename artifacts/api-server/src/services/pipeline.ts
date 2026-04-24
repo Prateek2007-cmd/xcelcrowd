@@ -229,15 +229,23 @@ export async function reindexQueue(jobId: number, tx: typeof db = db): Promise<v
 }
 
 /**
- * Move an expired PENDING_ACKNOWLEDGMENT application back to WAITLIST
- * with a positional penalty proportional to their penalty count.
+ * Move an expired PENDING_ACKNOWLEDGMENT application back to WAITLIST,
+ * placing them at the END of the queue to preserve FIFO fairness.
  *
- * Penalty position = MAX(current_positions) + 1 + penaltyCount
- * This means repeat offenders land progressively further back,
- * giving well-behaved applicants priority over chronic non-responders.
+ * The penaltyCount is incremented to track repeated expiries on the
+ * applications table, but queue position is always simply:
+ * MAX(position) + 1 — ensuring strict FIFO order, with no applicant
+ * being promoted before those who applied earlier.
  *
- * Clears promotedAt and acknowledgeDeadline so the row reflects
- * a clean WAITLIST state with no stale promotion metadata.
+ * Steps:
+ *   1. Remove any existing queue entry for this application (defensive)
+ *   2. Calculate end-of-queue position: MAX(position) + 1
+ *   3. Insert new queue entry at the end
+ *   4. Update application status to WAITLIST and clear deadlines
+ *   5. Log DECAY_TRIGGERED event
+ *
+ * This ensures that expired applicants NEVER jump ahead of older applicants
+ * in the queue, regardless of penalty count.
  */
 export async function applyPenaltyAndRequeue(
   applicationId: number,
@@ -251,49 +259,60 @@ export async function applyPenaltyAndRequeue(
 
   if (!app) return;
 
-  const penaltyCount = app.penaltyCount + 1;
-
+  // STEP 1: Remove any stale queue entry (defensive — should not exist, but guard anyway)
   await tx
-    .update(applicationsTable)
-    .set({
-      status: "WAITLIST",
-      penaltyCount,
-      promotedAt: null,
-      acknowledgeDeadline: null,
-    })
-    .where(eq(applicationsTable.id, applicationId));
+    .delete(queuePositionsTable)
+    .where(eq(queuePositionsTable.applicationId, applicationId));
 
-  // MAX(position) gives the current back of the queue.
-  // Adding 1 + penaltyCount places this applicant behind everyone else,
-  // with extra distance on repeated misses.
+  // STEP 2: Calculate end-of-queue position (strict FIFO: just append to end)
   const [lastRow] = await tx
     .select({ maxPos: sql<number>`MAX(${queuePositionsTable.position})` })
     .from(queuePositionsTable)
     .where(eq(queuePositionsTable.jobId, jobId));
 
   const maxPos = Number(lastRow?.maxPos ?? 0);
-  const penaltyPos = maxPos + 1 + penaltyCount;
+  const newPosition = maxPos + 1;  // Append to end — FIFO guaranteed
 
+  // STEP 3: Insert new queue entry at the end
   await tx.insert(queuePositionsTable).values({
     jobId,
     applicationId,
-    position: penaltyPos,
+    position: newPosition,
   });
 
+  // STEP 4: Update application status back to WAITLIST
+  const penaltyCount = app.penaltyCount + 1;
+  await tx
+    .update(applicationsTable)
+    .set({
+      status: "WAITLIST",
+      penaltyCount,  // Track expiries for analytics, not for queue positioning
+      promotedAt: null,
+      acknowledgeDeadline: null,
+    })
+    .where(eq(applicationsTable.id, applicationId));
+
+  // STEP 5: Log the decay event
   await tx.insert(auditLogsTable).values({
     applicationId,
     eventType: "DECAY_TRIGGERED",
     fromStatus: "PENDING_ACKNOWLEDGMENT",
     toStatus: "WAITLIST",
-    metadata: { penaltyCount, newPosition: penaltyPos, jobId },
+    metadata: { penaltyCount, newPosition, jobId },
   });
 
-  logger.info({ applicationId, jobId, penaltyCount, penaltyPos }, "Decay triggered, applicant penalized");
+  logger.info(
+    { applicationId, jobId, penaltyCount, newPosition },
+    "Decay triggered: applicant moved to end of queue"
+  );
 }
 
 /**
  * Decay all expired PENDING_ACKNOWLEDGMENT applicants for a job,
  * then fill all vacated slots from the waitlist in one pass.
+ *
+ * CRITICAL: Expired applicants are MOVED TO THE END OF THE QUEUE, never re-promoted
+ * before older applicants. Uses strict queuePositionsTable.position ordering (FIFO).
  *
  * Runs entirely inside the provided `tx` so the caller (decayWorker)
  * can wrap per-job decay in its own transaction and roll back cleanly
@@ -306,8 +325,7 @@ export async function checkAndDecayExpiredAcknowledgments(
   jobCapacity: number,
   tx: typeof db = db
 ): Promise<number> {
-  // Snapshot "now" once for the entire cycle to ensure a consistent
-  // deadline boundary — avoids drift if individual penalty calls take time.
+  // Snapshot "now" once for the entire cycle to ensure consistent deadline boundary
   const now = new Date();
   const expired = await tx
     .select()
@@ -320,14 +338,18 @@ export async function checkAndDecayExpiredAcknowledgments(
       )
     );
 
+  // Process all expired applications: move each to end of queue
   let decayed = 0;
   for (const app of expired) {
     await applyPenaltyAndRequeue(app.id, jobId, tx);
     decayed++;
   }
 
-  // After all decays, fill vacated slots in a single promoteUntilFull pass
-  // rather than promoting one-by-one to minimize round trips.
+  // After all decays, fill vacated slots in a single promoteUntilFull pass.
+  // This ensures:
+  //   1. Next promotion strictly follows queuePositionsTable.position ASC (FIFO)
+  //   2. Expired applicants in their new end-of-queue positions are never jumped ahead of
+  //   3. Only one round trip of promotions happens per decay cycle
   if (decayed > 0) {
     await promoteUntilFull(jobId, jobCapacity, tx);
   }

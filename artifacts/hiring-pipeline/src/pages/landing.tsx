@@ -28,7 +28,14 @@ export default function LandingPage() {
       {/* Role Selection */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 w-full max-w-2xl">
         {/* Company Card */}
-        <Link href="/dashboard">
+        <Link
+          href="/dashboard"
+          onClick={() => {
+            localStorage.setItem("user_role", "admin");
+            localStorage.removeItem("applicant_email");
+            localStorage.removeItem("applicant_name");
+          }}
+        >
           <Card className="group cursor-pointer border-border/50 bg-card/80 backdrop-blur hover:border-primary/40 transition-all duration-300 h-full">
             <CardHeader className="text-center pb-3">
               <div className="mx-auto w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center mb-3 group-hover:bg-primary/20 transition-colors">
@@ -52,7 +59,12 @@ export default function LandingPage() {
         </Link>
 
         {/* Applicant Card */}
-        <Link href="/apply">
+        <Link
+          href="/apply"
+          onClick={() => {
+            localStorage.setItem("user_role", "applicant");
+          }}
+        >
           <Card className="group cursor-pointer border-border/50 bg-card/80 backdrop-blur hover:border-primary/40 transition-all duration-300 h-full">
             <CardHeader className="text-center pb-3">
               <div className="mx-auto w-14 h-14 rounded-full bg-emerald-500/10 flex items-center justify-center mb-3 group-hover:bg-emerald-500/20 transition-colors">

@@ -8,7 +8,6 @@ import {
   useGetApplicantStatus,
   useGetApplicantTimeline,
   useWithdrawApplication,
-  useAcknowledgePromotion,
   getGetApplicantStatusQueryKey,
   getGetApplicantTimelineQueryKey,
 } from "@workspace/api-client-react";
@@ -17,7 +16,6 @@ import { Layout } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { StatusBadge } from "@/components/status-badge";
-import { Countdown } from "@/components/countdown";
 import { Separator } from "@/components/ui/separator";
 import { useToast } from "@/hooks/use-toast";
 
@@ -39,7 +37,6 @@ export default function ApplicantDetail() {
   });
 
   const withdrawMutation = useWithdrawApplication();
-  const acknowledgeMutation = useAcknowledgePromotion();
 
   const handleWithdraw = (applicationId: number) => {
     withdrawMutation.mutate(
@@ -52,22 +49,6 @@ export default function ApplicantDetail() {
         },
         onError: () => {
           toast({ title: "Failed to withdraw", variant: "destructive" });
-        },
-      }
-    );
-  };
-
-  const handleAcknowledge = (applicationId: number) => {
-    acknowledgeMutation.mutate(
-      { data: { applicationId } },
-      {
-        onSuccess: () => {
-          queryClient.invalidateQueries({ queryKey: getGetApplicantStatusQueryKey(id) });
-          queryClient.invalidateQueries({ queryKey: getGetApplicantTimelineQueryKey(id) });
-          toast({ title: "Promotion acknowledged successfully" });
-        },
-        onError: () => {
-          toast({ title: "Failed to acknowledge", variant: "destructive" });
         },
       }
     );
@@ -128,33 +109,58 @@ export default function ApplicantDetail() {
                     statusData.applications.map((app) => (
                       <div key={app.applicationId} className="border rounded-lg p-4 bg-card/50">
                         <div className="flex items-start justify-between">
-                          <div>
+                          <div className="flex-1">
                             <Link href={`/jobs/${app.jobId}`} className="text-lg font-semibold hover:underline flex items-center gap-2">
                               {app.jobTitle}
                             </Link>
-                            <div className="flex items-center gap-3 mt-2">
-                              <StatusBadge status={app.status} />
-                              {app.status === "WAITLIST" && app.queuePosition !== null && (
-                                <span className="text-sm font-mono bg-amber-500/10 text-amber-500 px-2 py-0.5 rounded border border-amber-500/20">
-                                  POS #{app.queuePosition}
-                                </span>
+                            
+                            {/* Status Display */}
+                            <div className="flex items-center gap-3 mt-3">
+                              {app.status === "PENDING_ACKNOWLEDGMENT" && (
+                                <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-md px-3 py-1.5">
+                                  <p className="text-sm font-semibold text-emerald-600">
+                                    ⏳ Pending Acknowledgment
+                                  </p>
+                                </div>
                               )}
-                              <span className="text-xs text-muted-foreground font-mono">
-                                App ID: {app.applicationId}
-                              </span>
+                              
+                              {app.status === "ACTIVE" && (
+                                <div className="bg-blue-500/10 border border-blue-500/30 rounded-md px-3 py-1.5">
+                                  <p className="text-sm font-semibold text-blue-600">
+                                    ✅ Active
+                                  </p>
+                                </div>
+                              )}
+                              
+                              {app.status === "WAITLIST" && (
+                                <div className="bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-1.5">
+                                  <p className="text-sm font-semibold text-amber-600">
+                                    ⏳ Waitlisted
+                                  </p>
+                                  {app.queuePosition !== null && (
+                                    <p className="text-xs text-amber-600/80 mt-0.5">
+                                      Position #{app.queuePosition}
+                                    </p>
+                                  )}
+                                </div>
+                              )}
+                              
+                              {app.status === "INACTIVE" && (
+                                <div className="bg-gray-500/10 border border-gray-500/30 rounded-md px-3 py-1.5">
+                                  <p className="text-sm font-semibold text-gray-600">
+                                    ❌ Inactive
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+                            
+                            <div className="text-xs text-muted-foreground font-mono mt-2">
+                              App ID: {app.applicationId} • Applied: {format(new Date(app.appliedAt), "MMM d, yyyy HH:mm")}
                             </div>
                           </div>
-                          <div className="flex flex-col gap-2">
-                            {app.status === "PENDING_ACKNOWLEDGMENT" && (
-                              <Button
-                                size="sm"
-                                className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)] animate-pulse"
-                                onClick={() => handleAcknowledge(app.applicationId)}
-                                disabled={acknowledgeMutation.isPending}
-                              >
-                                <CheckCircle className="mr-2 h-4 w-4" /> Acknowledge Spot
-                              </Button>
-                            )}
+                          
+                          {/* Action Buttons */}
+                          <div className="flex flex-col gap-2 ml-4">
                             {app.status !== "INACTIVE" && (
                               <Button
                                 variant="outline"
@@ -163,24 +169,11 @@ export default function ApplicantDetail() {
                                 onClick={() => handleWithdraw(app.applicationId)}
                                 disabled={withdrawMutation.isPending}
                               >
-                                <XCircle className="mr-2 h-4 w-4" /> Remove from Pipeline
+                                <XCircle className="mr-2 h-4 w-4" /> 
+                                {withdrawMutation.isPending ? "Removing..." : "Withdraw"}
                               </Button>
                             )}
                           </div>
-                        </div>
-
-                        {app.status === "PENDING_ACKNOWLEDGMENT" && (
-                          <div className="mt-4 p-3 bg-red-500/5 border border-red-500/20 rounded text-sm flex justify-between items-center">
-                            <span className="text-red-400 font-medium">Spot offered! Acknowledgment required.</span>
-                            <Countdown deadline={app.acknowledgeDeadline} />
-                          </div>
-                        )}
-                        
-                        <div className="mt-4 pt-4 border-t text-xs text-muted-foreground flex justify-between font-mono">
-                          <span>Applied: {format(new Date(app.appliedAt), "MMM d, yyyy HH:mm")}</span>
-                          {app.timeInCurrentStateSeconds !== undefined && (
-                            <span>Time in state: {Math.floor(app.timeInCurrentStateSeconds / 60)}m</span>
-                          )}
                         </div>
                       </div>
                     ))

@@ -19,6 +19,7 @@ import {
   ConflictError,
   DuplicateSubmissionError,
   GoneError,
+  DatabaseError,
 } from "../lib/errors";
 import { assertValidTransition } from "../lib/stateMachine";
 import {
@@ -63,6 +64,10 @@ export interface AcknowledgeResult {
 /**
  * Apply an applicant to a job.
  * Returns a new ApplyResult — never mutates input.
+ * 
+ * IMPORTANT: All applications start as WAITLIST.
+ * If capacity available, system promotes to PENDING_ACKNOWLEDGMENT (user must accept).
+ * User cannot go directly to ACTIVE without clicking "Accept".
  */
 export async function applyToJob(applicantId: number, jobId: number): Promise<ApplyResult> {
   // Validate applicant exists
@@ -101,9 +106,9 @@ export async function applyToJob(applicantId: number, jobId: number): Promise<Ap
     throw new DuplicateSubmissionError(applicantId, jobId);
   }
 
+  let newAppId = 0;
   let finalStatus: ApplicationStatus = "WAITLIST";
   let queuePosition: number | null = null;
-  let newAppId = 0;
 
   await db.transaction(async (tx) => {
     // Run decay inside transaction for consistency
@@ -111,16 +116,14 @@ export async function applyToJob(applicantId: number, jobId: number): Promise<Ap
 
     const activeCount = await getActiveCount(jobId, tx);
 
-    if (activeCount < job.capacity) {
-      finalStatus = "ACTIVE";
-    }
-
+    // ✅ IMPORTANT: Start as WAITLIST, never ACTIVE directly
+    // All applications begin in WAITLIST status
     const [newApp] = await tx
       .insert(applicationsTable)
       .values({
         jobId,
         applicantId,
-        status: finalStatus,
+        status: "WAITLIST",  // ✅ Always start here
       })
       .returning();
 
@@ -130,11 +133,39 @@ export async function applyToJob(applicantId: number, jobId: number): Promise<Ap
       applicationId: newApp.id,
       eventType: "APPLIED",
       fromStatus: null,
-      toStatus: finalStatus,
+      toStatus: "WAITLIST",
       metadata: { jobId, applicantId },
     });
 
-    if (finalStatus === "WAITLIST") {
+    // ✅ If capacity available, promote to PENDING_ACKNOWLEDGMENT immediately
+    // This allows the applicant dashboard to show "Accept" button
+    if (activeCount < job.capacity) {
+      const deadline = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+      await tx
+        .update(applicationsTable)
+        .set({
+          status: "PENDING_ACKNOWLEDGMENT",
+          promotedAt: new Date(),
+          acknowledgeDeadline: deadline,
+        })
+        .where(eq(applicationsTable.id, newApp.id));
+
+      await tx.insert(auditLogsTable).values({
+        applicationId: newApp.id,
+        eventType: "PROMOTED",
+        fromStatus: "WAITLIST",
+        toStatus: "PENDING_ACKNOWLEDGMENT",
+        metadata: {
+          acknowledgeDeadline: deadline.toISOString(),
+          jobId,
+        },
+      });
+
+      finalStatus = "PENDING_ACKNOWLEDGMENT";
+    } else {
+      // No capacity — add to queue
+      finalStatus = "WAITLIST";
       const [lastRow] = await tx
         .select({ maxPos: sql<number>`MAX(${queuePositionsTable.position})` })
         .from(queuePositionsTable)
@@ -158,8 +189,8 @@ export async function applyToJob(applicantId: number, jobId: number): Promise<Ap
     status: finalStatus,
     queuePosition,
     message:
-      finalStatus === "ACTIVE"
-        ? "You have been placed in an active slot."
+      finalStatus === "PENDING_ACKNOWLEDGMENT"
+        ? "You've been promoted! Please accept this offer within 10 minutes."
         : `You have been added to the waitlist at position ${queuePosition}.`,
   };
 }
@@ -320,20 +351,28 @@ export async function acknowledgePromotion(applicationId: number): Promise<Ackno
     message: "Promotion acknowledged. You are now ACTIVE.",
   };
 }
+
 /**
- * Public apply flow:
- * - Atomic applicant creation (no race condition)
- * - Apply to job
+ * Public apply flow: resolve applicant + atomic application creation
+ * 1. Resolve applicant (create if new, fetch if existing) — handles duplicate email gracefully
+ * 2. Validate job exists
+ * 3. In transaction:
+ *    - Check for duplicate application
+ *    - Run decay check
+ *    - Assign status (ACTIVE or WAITLIST)
+ *    - Insert application + audit log + queue position
+ *
+ * Returns ApplyResult with consistent state.
  */
 export async function applyPublic(
   name: string,
   email: string,
   jobId: number
-) {
+): Promise<ApplyResult> {
+  // ── Step 1: Resolve applicant (create if new, fetch if existing) ──
   let applicantId: number;
 
   try {
-    // Try inserting directly (atomic operation)
     const [created] = await db
       .insert(applicantsTable)
       .values({ name, email })
@@ -341,22 +380,133 @@ export async function applyPublic(
 
     applicantId = created.id;
   } catch (err: any) {
-    // Handle duplicate email (unique constraint)
-    if (err.code === "23505") {
-      const [existing] = await db
+    // Handle duplicate email (Postgres)
+    const errorCode = err?.code || err?.cause?.code;
+
+    if (errorCode === "23505") {
+      const existing = await db
         .select()
         .from(applicantsTable)
-        .where(eq(applicantsTable.email, email));
+        .where(eq(applicantsTable.email, email))
+        .limit(1);
 
-      if (!existing) {
-        throw err; // safety fallback
+      if (!existing || existing.length === 0) {
+        throw new Error("Applicant exists but could not be fetched");
       }
 
-      applicantId = existing.id;
+      applicantId = existing[0].id;
     } else {
       throw err;
     }
   }
 
-  return applyToJob(applicantId, jobId);
+  // ── Step 2: Validate job exists before entering transaction ──
+  const [job] = await db.select().from(jobsTable).where(eq(jobsTable.id, jobId));
+
+  if (!job) {
+    throw new NotFoundError("Job", jobId);
+  }
+
+  // ── Step 3: Run application logic in atomic transaction ──
+  return db.transaction(async (tx) => {
+    // Check for duplicate active application
+    const existingApps = await tx
+      .select()
+      .from(applicationsTable)
+      .where(
+        and(
+          eq(applicationsTable.applicantId, applicantId),
+          eq(applicationsTable.jobId, jobId)
+        )
+      );
+
+    const activeApp = existingApps.find((a) => a.status !== "INACTIVE");
+    if (activeApp) {
+      throw new DuplicateSubmissionError(applicantId, jobId);
+    }
+
+    // Decay check and determine status
+    await checkAndDecayExpiredAcknowledgments(jobId, job.capacity, tx as any);
+
+    const activeCount = await getActiveCount(jobId, tx as any);
+
+    // ✅ IMPORTANT: All applications start as WAITLIST
+    // If capacity available, promote to PENDING_ACKNOWLEDGMENT (requires user acceptance)
+    // Never set directly to ACTIVE
+    let finalStatus: ApplicationStatus = "WAITLIST";
+    let queuePosition: number | null = null;
+
+    // Insert application as WAITLIST first
+    const [newApp] = await tx
+      .insert(applicationsTable)
+      .values({
+        jobId,
+        applicantId,
+        status: "WAITLIST",  // ✅ Always start here
+      })
+      .returning();
+
+    // Insert audit log for initial application
+    await tx.insert(auditLogsTable).values({
+      applicationId: newApp.id,
+      eventType: "APPLIED",
+      fromStatus: null,
+      toStatus: "WAITLIST",
+      metadata: { jobId, applicantId },
+    });
+
+    // ✅ If capacity available, promote to PENDING_ACKNOWLEDGMENT immediately
+    if (activeCount < job.capacity) {
+      const deadline = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+      await tx
+        .update(applicationsTable)
+        .set({
+          status: "PENDING_ACKNOWLEDGMENT",
+          promotedAt: new Date(),
+          acknowledgeDeadline: deadline,
+        })
+        .where(eq(applicationsTable.id, newApp.id));
+
+      await tx.insert(auditLogsTable).values({
+        applicationId: newApp.id,
+        eventType: "PROMOTED",
+        fromStatus: "WAITLIST",
+        toStatus: "PENDING_ACKNOWLEDGMENT",
+        metadata: {
+          acknowledgeDeadline: deadline.toISOString(),
+          jobId,
+        },
+      });
+
+      finalStatus = "PENDING_ACKNOWLEDGMENT";
+    } else {
+      // No capacity — add to queue
+      const [lastRow] = await tx
+        .select({ maxPos: sql<number>`MAX(${queuePositionsTable.position})` })
+        .from(queuePositionsTable)
+        .where(eq(queuePositionsTable.jobId, jobId));
+
+      queuePosition = Number(lastRow?.maxPos ?? 0) + 1;
+
+      await tx.insert(queuePositionsTable).values({
+        jobId,
+        applicationId: newApp.id,
+        position: queuePosition,
+      });
+    }
+
+    // Return result
+    return {
+      applicationId: newApp.id,
+      applicantId,
+      jobId,
+      status: finalStatus,
+      queuePosition,
+      message:
+        finalStatus === "PENDING_ACKNOWLEDGMENT"
+          ? "You've been promoted! Please accept this offer within 10 minutes."
+          : `You have been added to the waitlist at position ${queuePosition}.`,
+    };
+  });
 }

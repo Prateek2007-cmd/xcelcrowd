@@ -12,9 +12,10 @@ import {
   Plus,
   Info,
   Send,
+  CheckCircle,
 } from "lucide-react";
 
-import { useListJobs } from "@workspace/api-client-react";
+import { useListJobs, useAcknowledgePromotion } from "@workspace/api-client-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -33,6 +34,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { StatusBadge } from "@/components/status-badge";
+import { Countdown } from "@/components/countdown";
 import { useToast } from "@/hooks/use-toast";
 
 // ── Types ──────────────────────────────────────────
@@ -70,14 +72,19 @@ function formatTimeAgo(seconds: number): string {
 function ApplicationCard({
   app,
   onWithdraw,
+  onAcknowledge,
   withdrawingId,
+  acknowledgingId,
 }: {
   app: ApplicationEntry;
   onWithdraw: (id: number) => void;
+  onAcknowledge: (id: number) => void;
   withdrawingId: number | null;
+  acknowledgingId: number | null;
 }) {
   const isInactive = app.status === "INACTIVE";
   const isWithdrawing = withdrawingId === app.applicationId;
+  const isAcknowledging = acknowledgingId === app.applicationId;
 
   return (
     <div className="rounded-lg border border-border/50 bg-card/50 p-4 space-y-3">
@@ -143,14 +150,40 @@ function ApplicationCard({
         )}
       </div>
 
-      {!isInactive && (
-        <div className="pt-1">
+      {app.status === "PENDING_ACKNOWLEDGMENT" && (
+        <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-md p-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-sm font-semibold text-emerald-600">
+              🎉 You've been promoted!
+            </p>
+            <Countdown deadline={app.acknowledgeDeadline} />
+          </div>
+          <p className="text-xs text-emerald-600/80">
+            Accept this offer before the deadline expires
+          </p>
+        </div>
+      )}
+
+      <div className="flex gap-2 pt-3">
+        {app.status === "PENDING_ACKNOWLEDGMENT" && (
           <Button
-            variant="ghost"
+            size="sm"
+            className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white shadow-[0_0_15px_rgba(16,185,129,0.3)]"
+            onClick={() => onAcknowledge(app.applicationId)}
+            disabled={isAcknowledging}
+          >
+            <CheckCircle className="mr-2 h-4 w-4" />
+            {isAcknowledging ? "Accepting..." : "Accept Offer"}
+          </Button>
+        )}
+
+        {!isInactive && (
+          <Button
+            variant="outline"
             size="sm"
             disabled={isWithdrawing}
             onClick={() => onWithdraw(app.applicationId)}
-            className="text-destructive hover:text-destructive hover:bg-destructive/10 text-xs w-full"
+            className="flex-1 text-destructive hover:text-destructive hover:bg-destructive/10"
           >
             {isWithdrawing ? (
               <>
@@ -160,10 +193,16 @@ function ApplicationCard({
             ) : (
               <>
                 <LogOut className="mr-1.5 h-3 w-3" />
-                Withdraw Application
+                Withdraw
               </>
             )}
           </Button>
+        )}
+      </div>
+
+      {isInactive && (
+        <div className="pt-1">
+          <p className="text-xs text-muted-foreground text-center">This application has been closed</p>
         </div>
       )}
     </div>
@@ -192,12 +231,14 @@ export default function CheckStatusPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [withdrawingId, setWithdrawingId] = useState<number | null>(null);
+  const [acknowledgingId, setAcknowledgingId] = useState<number | null>(null);
   const [wasRestored, setWasRestored] = useState(false);
 
   // Apply-to-job state
   const [selectedJobId, setSelectedJobId] = useState("");
   const [applying, setApplying] = useState(false);
   const { data: jobs, isLoading: jobsLoading } = useListJobs();
+  const acknowledgeMutation = useAcknowledgePromotion();
 
   // Auto-login from localStorage on mount
   useEffect(() => {
@@ -312,6 +353,43 @@ export default function CheckStatusPage() {
       });
     } finally {
       setWithdrawingId(null);
+    }
+  };
+
+  const handleAcknowledge = async (applicationId: number) => {
+    setAcknowledgingId(applicationId);
+    try {
+      acknowledgeMutation.mutate(
+        { data: { applicationId } },
+        {
+          onSuccess: (data) => {
+            toast({
+              title: "Offer accepted!",
+              description: data?.message || "You have accepted the offer successfully.",
+            });
+            refreshDashboard();
+          },
+          onError: (error: unknown) => {
+            const errorMessage =
+              error instanceof Error ? error.message : "Failed to accept offer";
+            toast({
+              title: "Failed to accept offer",
+              description: errorMessage,
+              variant: "destructive",
+            });
+          },
+          onSettled: () => {
+            setAcknowledgingId(null);
+          },
+        }
+      );
+    } catch (err: unknown) {
+      toast({
+        title: "Failed to accept offer",
+        description: err instanceof Error ? err.message : "Something went wrong",
+        variant: "destructive",
+      });
+      setAcknowledgingId(null);
     }
   };
 
@@ -597,7 +675,9 @@ export default function CheckStatusPage() {
                     key={app.applicationId}
                     app={app}
                     onWithdraw={handleWithdraw}
+                    onAcknowledge={handleAcknowledge}
                     withdrawingId={withdrawingId}
+                    acknowledgingId={acknowledgingId}
                   />
                 ))}
 
@@ -615,7 +695,9 @@ export default function CheckStatusPage() {
                         <ApplicationCard
                           app={app}
                           onWithdraw={handleWithdraw}
+                          onAcknowledge={handleAcknowledge}
                           withdrawingId={withdrawingId}
+                          acknowledgingId={acknowledgingId}
                         />
                       </div>
                     ))}
