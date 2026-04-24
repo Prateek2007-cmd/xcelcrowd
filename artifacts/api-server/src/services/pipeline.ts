@@ -100,15 +100,15 @@ export async function promoteNext(
   jobId: number,
   jobCapacity: number,
   tx: typeof db = db
-): Promise<void> {
+): Promise<boolean> {
   const activeCount = await getActiveCount(jobId, tx);
   if (activeCount >= jobCapacity) {
-    return;
+    return false;
   }
 
   const next = await getNextInQueue(jobId, tx);
   if (!next) {
-    return;
+    return false;
   }
 
   const deadline = new Date(Date.now() + ACKNOWLEDGE_WINDOW_MS);
@@ -124,7 +124,7 @@ export async function promoteNext(
     await tx
       .delete(queuePositionsTable)
       .where(eq(queuePositionsTable.applicationId, next.applicationId));
-    return;
+    return false;
   }
 
   await tx
@@ -157,6 +157,8 @@ export async function promoteNext(
     { applicationId: next.applicationId, jobId, deadline },
     "Applicant promoted to PENDING_ACKNOWLEDGMENT"
   );
+
+  return true;
 }
 
 /**
@@ -190,17 +192,10 @@ export async function promoteUntilFull(
   if (candidates.length === 0) return 0;
 
   let promoted = 0;
-  for (const candidate of candidates) {
-    // promoteNext re-checks capacity internally — handles edge cases where
-    // a stale queue entry was skipped and actual promotable count is lower.
-    const before = promoted;
-    await promoteNext(jobId, jobCapacity, tx);
-    // promoteNext doesn't return a value; detect success by checking
-    // whether the queue entry was consumed (reindex changes positions).
-    // We use a simple increment here — worst case we over-count by stale entries,
-    // which is harmless since promoteNext is idempotent on bad entries.
+  for (const _candidate of candidates) {
+    const success = await promoteNext(jobId, jobCapacity, tx);
+    if (!success) break;
     promoted++;
-    void candidate; // consumed implicitly by promoteNext
   }
   return promoted;
 }
