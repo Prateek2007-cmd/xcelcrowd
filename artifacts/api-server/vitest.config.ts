@@ -6,6 +6,7 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: ["src/**/*.test.ts"],
+    envFile: ".env",
     coverage: {
       provider: "v8",
       include: ["src/services/**", "src/lib/**"],
