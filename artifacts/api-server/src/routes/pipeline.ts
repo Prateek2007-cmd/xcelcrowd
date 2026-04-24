@@ -21,7 +21,7 @@ import {
 } from "@workspace/api-zod";
 import { validateParams } from "../middlewares/validate";
 import { NotFoundError, ValidationError } from "../lib/errors";
-import { replayPipeline } from "../services/pipeline";
+import { getPipelineSnapshot, replayPipelineFromAuditLog } from "../services/pipeline";
 
 
 const router: IRouter = Router();
@@ -182,12 +182,15 @@ router.get("/pipeline/:jobId/replay", validateParams(ReplayPipelineParams), asyn
       throw new NotFoundError("Job", jobId);
     }
 
-    const asOf = queryParsed.data.asOf ? new Date(queryParsed.data.asOf) : new Date();
-
-    // All business logic delegated to service layer
-    const result = await replayPipeline(jobId, asOf);
-
-    res.json(result);
+    // O(1) snapshot for current state; O(n) audit replay only for historical queries
+    if (queryParsed.data.asOf) {
+      const asOf = new Date(queryParsed.data.asOf);
+      const result = await replayPipelineFromAuditLog(jobId, asOf);
+      res.json(result);
+    } else {
+      const result = await getPipelineSnapshot(jobId);
+      res.json(result);
+    }
   } catch (err) {
     next(err);
   }

@@ -402,19 +402,111 @@ export async function runDecayForJob(
 }
 
 /**
- * Replay the pipeline state for a job as of a given point in time.
+ * Get the current pipeline state for a job — O(1) snapshot.
  *
- * Reconstructs the pipeline by:
- *   1. Fetching all applications created on or before `asOf`
- *   2. Replaying audit log events in chronological order to derive
- *      each application's status at that moment
- *   3. Partitioning into active vs waitlisted applicants
+ * Reads DIRECTLY from the applications and queue_positions tables,
+ * which already represent the latest state. No audit log replay.
  *
- * This is a pure read operation — no state mutations.
- * Previously lived inline in the route handler; extracted here
- * so it can be reused and unit-tested independently.
+ * Two queries:
+ *   1. JOIN applications + applicants for all non-INACTIVE apps
+ *   2. LEFT JOIN queue_positions for waitlist ordering
+ *
+ * This is the PRIMARY function for the /pipeline/:jobId/replay endpoint.
+ * Use `replayPipelineFromAuditLog()` only for historical debugging.
  */
-export async function replayPipeline(
+export async function getPipelineSnapshot(
+  jobId: number
+): Promise<{
+  jobId: number;
+  asOf: string;
+  activeApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+  }>;
+  waitlistApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+    queuePosition: number | null;
+  }>;
+}> {
+  const rows = await db
+    .select({
+      applicationId: applicationsTable.id,
+      applicantId: applicantsTable.id,
+      applicantName: applicantsTable.name,
+      status: applicationsTable.status,
+      queuePosition: queuePositionsTable.position,
+    })
+    .from(applicationsTable)
+    .innerJoin(
+      applicantsTable,
+      eq(applicationsTable.applicantId, applicantsTable.id)
+    )
+    .leftJoin(
+      queuePositionsTable,
+      eq(queuePositionsTable.applicationId, applicationsTable.id)
+    )
+    .where(eq(applicationsTable.jobId, jobId));
+
+  const activeApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+  }> = [];
+
+  const waitlistApplicants: Array<{
+    applicationId: number;
+    applicantId: number;
+    applicantName: string;
+    status: string;
+    queuePosition: number | null;
+  }> = [];
+
+  for (const row of rows) {
+    if (row.status === "ACTIVE" || row.status === "PENDING_ACKNOWLEDGMENT") {
+      activeApplicants.push({
+        applicationId: row.applicationId,
+        applicantId: row.applicantId,
+        applicantName: row.applicantName,
+        status: row.status,
+      });
+    } else if (row.status === "WAITLIST") {
+      waitlistApplicants.push({
+        applicationId: row.applicationId,
+        applicantId: row.applicantId,
+        applicantName: row.applicantName,
+        status: row.status,
+        queuePosition: row.queuePosition ?? null,
+      });
+    }
+  }
+
+  waitlistApplicants.sort(
+    (a, b) => (a.queuePosition ?? 9999) - (b.queuePosition ?? 9999)
+  );
+
+  return {
+    jobId,
+    asOf: new Date().toISOString(),
+    activeApplicants,
+    waitlistApplicants,
+  };
+}
+
+/**
+ * Replay the pipeline state for a job at a HISTORICAL point in time.
+ *
+ * ⚠️  ADMIN/DEBUG ONLY — O(n) in the number of audit log entries.
+ * For the current state, use `getPipelineSnapshot()` instead (O(1)).
+ *
+ * Reconstructs by replaying audit log events chronologically.
+ */
+export async function replayPipelineFromAuditLog(
   jobId: number,
   asOf: Date = new Date()
 ): Promise<{
