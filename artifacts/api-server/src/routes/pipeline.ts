@@ -19,8 +19,8 @@ import {
   ReplayPipelineParams,
   ReplayPipelineQueryParams,
 } from "@workspace/api-zod";
-import { validateParams } from "../middlewares/validate";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { validateParams, validateQuery } from "../middlewares/validate";
+import { NotFoundError } from "../lib/errors";
 import { getPipelineSnapshot, replayPipelineFromAuditLog } from "../services/pipeline";
 
 
@@ -163,37 +163,37 @@ router.get("/pipeline/:jobId/summary", validateParams(GetPipelineSummaryParams),
   }
 });
 
-router.get("/pipeline/:jobId/replay", validateParams(ReplayPipelineParams), async (req, res, next): Promise<void> => {
-  try {
-    const { jobId } = res.locals.params;
+router.get(
+  "/pipeline/:jobId/replay",
+  validateParams(ReplayPipelineParams),
+  validateQuery(ReplayPipelineQueryParams),
+  async (_req, res, next): Promise<void> => {
+    try {
+      const { jobId } = res.locals.params;
+      const { asOf } = res.locals.query;
 
-    const queryParsed = ReplayPipelineQueryParams.safeParse(req.query);
-    if (!queryParsed.success) {
-      throw new ValidationError(queryParsed.error.message);
+      // Verify job exists before delegating to service
+      const [job] = await db
+        .select()
+        .from(jobsTable)
+        .where(eq(jobsTable.id, jobId));
+
+      if (!job) {
+        throw new NotFoundError("Job", jobId);
+      }
+
+      // O(1) snapshot for current state; O(n) audit replay only for historical queries
+      if (asOf) {
+        const result = await replayPipelineFromAuditLog(jobId, new Date(asOf));
+        res.json(result);
+      } else {
+        const result = await getPipelineSnapshot(jobId);
+        res.json(result);
+      }
+    } catch (err) {
+      next(err);
     }
-
-    // Verify job exists before delegating to service
-    const [job] = await db
-      .select()
-      .from(jobsTable)
-      .where(eq(jobsTable.id, jobId));
-
-    if (!job) {
-      throw new NotFoundError("Job", jobId);
-    }
-
-    // O(1) snapshot for current state; O(n) audit replay only for historical queries
-    if (queryParsed.data.asOf) {
-      const asOf = new Date(queryParsed.data.asOf);
-      const result = await replayPipelineFromAuditLog(jobId, asOf);
-      res.json(result);
-    } else {
-      const result = await getPipelineSnapshot(jobId);
-      res.json(result);
-    }
-  } catch (err) {
-    next(err);
   }
-});
+);
 
 export default router;
