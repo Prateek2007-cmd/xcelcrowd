@@ -16,13 +16,49 @@ import { db } from "@workspace/db";
 
 // ── Mock database layer ──
 vi.mock("@workspace/db", () => {
-  const mockTx = {
-    select: vi.fn(),
-    insert: vi.fn(),
-    update: vi.fn(),
-    delete: vi.fn(),
-    execute: vi.fn(),
+  // Create a function that returns chainable mocks
+  const createChainableMock = (result: any[] = []) => {
+    const chainObj: any = {
+      from: vi.fn(),
+      where: vi.fn(),
+      limit: vi.fn(),
+      set: vi.fn(),
+      values: vi.fn(),
+      returning: vi.fn(),
+    };
+
+    // Make all chainable methods return a thenable chain object
+    const chain = () => {
+      const newChain = Object.create(chainObj);
+      return newChain;
+    };
+
+    chainObj.from = vi.fn().mockReturnValue(chainObj);
+    chainObj.where = vi.fn().mockReturnValue(chainObj);
+    chainObj.limit = vi.fn().mockReturnValue(chainObj);
+    chainObj.set = vi.fn().mockReturnValue(chainObj);
+    chainObj.values = vi.fn().mockReturnValue(chainObj);
+    chainObj.returning = vi.fn().mockReturnValue(chainObj);
+
+    // Make it thenable (awaitable) - resolves to result array
+    chainObj.then = vi.fn((onFulfilled) => {
+      return Promise.resolve(result).then(onFulfilled);
+    });
+
+    return chainObj;
   };
+
+  // Set up transaction mock to provide a working mockTx
+  const dbTransaction = vi.fn((callback) => {
+    const txWithChains: any = {
+      select: vi.fn().mockImplementation(() => createChainableMock([])),
+      insert: vi.fn().mockImplementation(() => createChainableMock([])),
+      update: vi.fn().mockImplementation(() => createChainableMock([])),
+      delete: vi.fn().mockImplementation(() => createChainableMock([])),
+      execute: vi.fn(),
+    };
+    return callback(txWithChains);
+  });
 
   return {
     db: {
@@ -31,7 +67,7 @@ vi.mock("@workspace/db", () => {
       update: vi.fn(),
       delete: vi.fn(),
       execute: vi.fn(),
-      transaction: vi.fn((callback) => callback(mockTx)),
+      transaction: dbTransaction,
     },
     applicationsTable: {},
     applicantsTable: {},
@@ -95,15 +131,28 @@ function createMockJob(overrides = {}) {
 
 // ── Mocking utilities ──
 function mockDbQuery(result: any[] = []) {
-  const chainFn = vi.fn()
-    .mockReturnValue({ limit: vi.fn().mockResolvedValue(result) })
-    .mockResolvedValue(result);
+  const createChain = () => {
+    const chainObj = {
+      from: vi.fn(),
+      where: vi.fn(),
+      limit: vi.fn(),
+    };
 
-  chainFn.where = vi.fn().mockReturnValue(chainFn);
-  chainFn.limit = vi.fn().mockReturnValue(chainFn);
-  chainFn.from = vi.fn().mockReturnValue(chainFn);
+    // Make all methods return the same chainable object
+    chainObj.from = vi.fn().mockReturnValue(chainObj);
+    chainObj.where = vi.fn().mockReturnValue(chainObj);
+    chainObj.limit = vi.fn().mockReturnValue(chainObj);
 
-  return chainFn;
+    // Make the chain thenable (awaitable) - resolves to result array
+    (chainObj as any).then = vi.fn((onFulfilled) => {
+      return Promise.resolve(result).then(onFulfilled);
+    });
+
+    return chainObj;
+  };
+
+  const chain = createChain();
+  return chain as any;
 }
 
 // ── Tests: applyToJob ──
@@ -345,38 +394,50 @@ describe("applicationService.applyPublic()", () => {
   });
 
   it("creates new applicant if email does not exist", async () => {
+    const applicant = createMockApplicant();
     const job = createMockJob();
 
+    // Mock insert applicant chain
     const mockInsertApplicant = {
-      values: vi.fn().mockResolvedValue([createMockApplicant()]),
+      values: vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([applicant]),
+      }),
     };
 
-    const mockSelectJob = mockDbQuery([job]);
-    const mockInsertApp = {
-      values: vi.fn().mockResolvedValue([{ id: 1 }]),
-    };
+    // Mock select for job lookup - use a fresh mockDbQuery for each select call
+    vi.mocked(db.select).mockImplementation(() => {
+      return mockDbQuery([job]) as any;
+    });
 
+    // Mock insert for applicant (succeeds) then insert for application (succeeds)
     vi.mocked(db.insert)
       .mockReturnValueOnce(mockInsertApplicant as any)
-      .mockReturnValueOnce(mockInsertApp as any)
-      .mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) } as any);
-
-    vi.mocked(db.select).mockReturnValue(mockSelectJob as any);
+      .mockReturnValueOnce({
+        values: vi.fn().mockResolvedValue([{ id: 1 }]),
+      } as any);
 
     const result = await applyPublic("John Doe", "john@example.com", 10);
-    expect(result.applicantId).toBe(100);
-    expect(vi.mocked(db.insert)).toHaveBeenCalledWith(expect.anything());
+    expect(result.applicantId).toBe(applicant.id);
+    expect(result.applicationId).toBe(1);
+    expect(vi.mocked(db.insert)).toHaveBeenCalled();
   });
 
   it("throws DatabaseError if job does not exist", async () => {
+    const applicant = createMockApplicant();
+
+    // Mock insert applicant chain
     const mockInsertApplicant = {
-      values: vi.fn().mockResolvedValue([createMockApplicant()]),
+      values: vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([applicant]),
+      }),
     };
 
-    const mockSelectJob = mockDbQuery([]); // Empty result
+    // Mock select to return empty for job lookup
+    vi.mocked(db.select).mockImplementation(() => {
+      return mockDbQuery([]) as any;
+    });
 
     vi.mocked(db.insert).mockReturnValueOnce(mockInsertApplicant as any);
-    vi.mocked(db.select).mockReturnValue(mockSelectJob as any);
 
     await expect(applyPublic("John Doe", "john@example.com", 999)).rejects.toThrow(
       NotFoundError
@@ -384,34 +445,69 @@ describe("applicationService.applyPublic()", () => {
   });
 
   it("reuses existing applicant on duplicate email error", async () => {
-    const existingApplicant = createMockApplicant();
+    const existingApplicant = createMockApplicant({ id: 42 });
     const job = createMockJob();
 
     const duplicateError = new Error("duplicate key");
     (duplicateError as any).code = "23505";
 
+    // Mock insert applicant to fail with duplicate constraint
     const mockInsertApplicant = {
-      values: vi.fn().mockRejectedValueOnce(duplicateError),
+      values: vi.fn().mockReturnValue({
+        returning: vi.fn().mockRejectedValueOnce(duplicateError),
+      }),
     };
 
-    const mockSelectExisting = mockDbQuery([existingApplicant]);
-    const mockSelectJob = mockDbQuery([job]);
-
-    let callCount = 0;
+    // Mock select calls: returns appropriate data for each call
+    let selectCallCount = 0;
     vi.mocked(db.select).mockImplementation(() => {
-      const selects = [mockSelectExisting, mockSelectJob];
-      return selects[callCount++] as any;
+      selectCallCount++;
+      // First select: fetch existing applicant (after duplicate error)
+      // Second select: fetch job for validation
+      return mockDbQuery(selectCallCount === 1 ? [existingApplicant] : [job]) as any;
+    });
+
+    // Mock insert: first for applicant (throws), then application insert doesn't need mocking
+    // because it happens in transaction with mockTx
+    vi.mocked(db.insert)
+      .mockReturnValueOnce(mockInsertApplicant as any);
+
+    const result = await applyPublic("John Doe", "john@example.com", 10);
+
+    // Verify applicant was reused
+    expect(result.applicantId).toBe(42);
+    expect(vi.mocked(db.insert)).toHaveBeenCalled();
+    expect(vi.mocked(db.select)).toHaveBeenCalled();
+  });
+
+  it("throws DatabaseError if duplicate email but applicant not found", async () => {
+    const duplicateError = new Error("duplicate key");
+    (duplicateError as any).code = "23505";
+
+    // Mock insert to fail with duplicate constraint
+    const mockInsertApplicant = {
+      values: vi.fn().mockReturnValue({
+        returning: vi.fn().mockRejectedValueOnce(duplicateError),
+      }),
+    };
+
+    // Mock select to always return empty (applicant not found despite duplicate error)
+    vi.mocked(db.select).mockImplementation(() => {
+      return mockDbQuery([]) as any;
     });
 
     vi.mocked(db.insert).mockReturnValueOnce(mockInsertApplicant as any);
 
-    const mockInsertApp = {
-      values: vi.fn().mockResolvedValue([{ id: 1 }]),
-    };
-    vi.mocked(db.insert).mockReturnValueOnce({ values: vi.fn() } as any);
+    // Should throw DatabaseError because duplicate exists but applicant not found
+    await expect(
+      applyPublic("John Doe", "john@example.com", 10)
+    ).rejects.toThrow(DatabaseError);
 
-    // This test demonstrates the duplicate email handling
-    // The actual implementation would reuse the applicant
+    // Verify insert was attempted
+    expect(vi.mocked(db.insert)).toHaveBeenCalled();
+
+    // Verify select was called to try to fetch existing applicant
+    expect(vi.mocked(db.select)).toHaveBeenCalled();
   });
 
   it("wraps unknown database errors in DatabaseError", async () => {
