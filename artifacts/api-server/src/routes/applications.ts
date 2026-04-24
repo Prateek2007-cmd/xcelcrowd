@@ -13,6 +13,7 @@ import { validateBody } from "../middlewares/validate";
 import { PublicApplyBody } from "../schemas/application";
 import {
   applyToJob,
+  applyPublic,
   withdrawApplication,
   acknowledgePromotion,
 } from "../services/applicationService";
@@ -46,7 +47,6 @@ router.post("/acknowledge", validateBody(AcknowledgePromotionBody), async (req, 
   }
 });
 
-import { applyPublic } from "../services/applicationService";
 
 router.post(
   "/apply-public",

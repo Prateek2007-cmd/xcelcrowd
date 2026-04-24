@@ -5,7 +5,7 @@ import { db } from "@workspace/db";
 import { applicationsTable, queuePositionsTable, auditLogsTable } from "@workspace/db";
 import { eq, and, sql } from "drizzle-orm";
 import { logger } from "../../lib/logger";
-import { AppError, PipelineError, DatabaseError } from "../../lib/errors";
+import { AppError, PipelineError } from "../../lib/errors";
 import { mapDbError } from "../../lib/dbErrorMapper";
 import type { TxHandle, DecayResult } from "./types";
 import { promoteUntilFull } from "./promote";

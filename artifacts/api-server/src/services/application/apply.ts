@@ -10,7 +10,7 @@ import {
   auditLogsTable,
   type ApplicationStatus,
 } from "@workspace/db";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   NotFoundError,
   DuplicateSubmissionError,
