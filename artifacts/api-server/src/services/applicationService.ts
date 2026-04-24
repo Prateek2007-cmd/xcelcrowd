@@ -30,6 +30,38 @@ import {
 } from "./pipeline";
 import { logger } from "../lib/logger";
 
+// ── Error classification helpers ──────────────────────────────────
+
+/**
+ * Extract PostgreSQL error code from various error structures.
+ * PostgreSQL errors can appear in multiple places depending on the driver.
+ */
+function getPgErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+
+  const errObj = err as Record<string, unknown>;
+  return (errObj.code as string) || (errObj.cause as Record<string, unknown>)?.code as string;
+}
+
+/**
+ * Type guard to check if error is an instance of Error.
+ */
+function isError(err: unknown): err is Error {
+  return err instanceof Error;
+}
+
+/**
+ * Format unknown error for logging and error messages.
+ */
+function formatErrorMessage(err: unknown): string {
+  if (isError(err)) return err.message;
+  if (typeof err === "string") return err;
+  if (typeof err === "object" && err !== null && "message" in err) {
+    return String((err as Record<string, unknown>).message);
+  }
+  return String(err);
+}
+
 // ── Result types (pure data, no side effects) ──────────────────────
 
 export interface ApplyResult {
@@ -410,16 +442,17 @@ export async function applyPublic(
       .returning();
 
     applicantId = created.id;
-  } catch (err: any) {
-    // If already an AppError, re-throw as-is
+  } catch (err: unknown) {
+    // ── Handle known application errors ──
     if (err instanceof DatabaseError) {
       throw err;
     }
 
-    // Handle duplicate email (Postgres error code 23505)
-    const errorCode = err?.code || err?.cause?.code;
+    // ── Handle PostgreSQL duplicate constraint (23505) ──
+    const pgErrorCode = getPgErrorCode(err);
+    const errorMessage = formatErrorMessage(err);
 
-    if (errorCode === "23505") {
+    if (pgErrorCode === "23505") {
       // Applicant with this email already exists — fetch and reuse
       try {
         const existing = await db
@@ -429,25 +462,65 @@ export async function applyPublic(
           .limit(1);
 
         if (!existing || existing.length === 0) {
+          logger.error(
+            {
+              errorCode: pgErrorCode,
+              email,
+              errorType: "CONSTRAINT_MISMATCH",
+            },
+            "Duplicate email constraint failed: applicant not found after detecting constraint"
+          );
           throw new DatabaseError(
-            "Applicant exists (duplicate email constraint) but could not be fetched from database"
+            "Applicant exists (duplicate email constraint) but could not be fetched from database",
+            { cause: "Constraint detected but query returned empty" }
           );
         }
 
         applicantId = existing[0].id;
-      } catch (fetchErr: any) {
-        // Wrap any fetch errors
+        logger.debug(
+          { email, applicantId, action: "applicant_reuse" },
+          "Duplicate applicant detected, reusing existing applicant"
+        );
+      } catch (fetchErr: unknown) {
+        // ── Handle fetch errors after constraint detection ──
         if (fetchErr instanceof DatabaseError) {
           throw fetchErr;
         }
-        throw new DatabaseError(
+
+        const fetchErrorMessage = formatErrorMessage(fetchErr);
+        logger.error(
+          {
+            originalError: errorMessage,
+            fetchError: fetchErrorMessage,
+            email,
+            errorType: "FETCH_AFTER_CONSTRAINT",
+          },
           "Failed to fetch existing applicant after detecting duplicate email"
+        );
+
+        throw new DatabaseError(
+          "Failed to fetch existing applicant after detecting duplicate email",
+          { cause: fetchErrorMessage }
         );
       }
     } else {
-      // Wrap all other unknown errors (including internal DB errors)
+      // ── Handle all other unknown errors ──
+      logger.error(
+        {
+          errorCode: pgErrorCode || "unknown",
+          errorMessage,
+          email,
+          errorType: isError(err) ? err.constructor.name : typeof err,
+        },
+        "Unknown database error during applicant creation or resolution"
+      );
+
       throw new DatabaseError(
-        "Failed to create or resolve applicant"
+        "Failed to create or resolve applicant",
+        {
+          cause: errorMessage,
+          code: pgErrorCode,
+        }
       );
     }
   }
